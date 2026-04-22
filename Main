@@ -1,0 +1,2192 @@
+import os
+import warnings
+import joblib
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import seaborn as sns
+from scipy.stats import pearsonr, spearmanr, kruskal, mannwhitneyu
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import (train_test_split, cross_val_score,
+                                      GridSearchCV, RandomizedSearchCV)
+from sklearn.metrics import (mean_squared_error, mean_absolute_error, r2_score,
+                              classification_report, confusion_matrix,
+                              roc_auc_score, roc_curve, precision_recall_curve,
+                              ConfusionMatrixDisplay)
+from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
+                               GradientBoostingRegressor, GradientBoostingClassifier)
+
+try:
+    from xgboost import XGBRegressor, XGBClassifier
+    USE_XGB   = True
+    XGB_LABEL = 'XGBoost'
+except ImportError:
+    XGBRegressor  = GradientBoostingRegressor
+    XGBClassifier = GradientBoostingClassifier
+    USE_XGB       = False
+    XGB_LABEL     = 'GradBoost'
+
+# Force fsspec to fully initialise before lightgbm triggers its import ──
+try:
+    import fsspec
+    import fsspec.utils          # ensures the sub-module is loaded first
+    import fsspec.compression    # pre-load the module that causes the circular import
+except Exception:
+    pass
+# ────────────────────────────────────────────────────────────────────────────────
+
+try:
+    from lightgbm import LGBMRegressor, LGBMClassifier
+    USE_LGBM   = True
+    LGBM_LABEL = 'LightGBM'
+except ImportError:
+    LGBMRegressor  = GradientBoostingRegressor
+    LGBMClassifier = GradientBoostingClassifier
+    USE_LGBM       = False
+    LGBM_LABEL     = 'GradBoost'
+
+try:
+    from imblearn.over_sampling import SMOTE
+    USE_SMOTE = True
+except ImportError:
+    USE_SMOTE = False
+
+try:
+    from statsmodels.stats.outliers_influence import variance_inflation_factor
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+
+warnings.filterwarnings('ignore')
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', None)
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+
+os.makedirs('outputs/models', exist_ok=True)
+os.makedirs('outputs/plots',  exist_ok=True)
+os.makedirs('outputs/eda',    exist_ok=True)
+
+try:
+    import google.colab
+    IN_COLAB = True
+    print("Running in Google Colab")
+except ImportError:
+    IN_COLAB = False
+    print("Running locally")
+
+
+def _is_notebook():
+    try:
+        from IPython import get_ipython
+        shell = get_ipython()
+        if shell is None:
+            return False
+        return shell.__class__.__name__ in ('ZMQInteractiveShell', 'Shell')
+    except Exception:
+        return False
+
+_NOTEBOOK = _is_notebook()
+
+SLIDE_DPI = 300
+SLIDE_W   = 12
+SLIDE_H   = 7
+
+plt.rcParams.update({
+    'font.size'       : 13,
+    'axes.titlesize'  : 15,
+    'axes.labelsize'  : 13,
+    'xtick.labelsize' : 11,
+    'ytick.labelsize' : 11,
+    'legend.fontsize' : 11,
+    'figure.dpi'      : 100,
+})
+
+
+def show_and_save(filepath, dpi=SLIDE_DPI):
+    plt.savefig(filepath, dpi=dpi, bbox_inches='tight', facecolor='white')
+    if _NOTEBOOK or IN_COLAB:
+        plt.show()
+    else:
+        plt.show()
+    plt.close()
+    print(f"  Saved ({dpi} dpi): {filepath}")
+
+
+if not (_NOTEBOOK or IN_COLAB):
+    try:
+        matplotlib.use('Agg')
+    except Exception:
+        pass
+
+def section(t):    print("\n" + "="*80 + f"\n  {t}\n" + "="*80)
+def subsection(t): print(f"\n  {'─'*60}\n  {t}\n  {'─'*60}")
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+DATA_DIR = '/content' if IN_COLAB else '.'
+
+FILE_PATHS = {
+    'BLER':       os.path.join(DATA_DIR, 'BLER_UE_Id_0_499.csv'),
+    'PRBS':       os.path.join(DATA_DIR, 'PRBS_UE_Id_0_499.csv'),
+    'RU':         os.path.join(DATA_DIR, 'RU_UE_Id_0_499.csv'),
+    'Throughput': os.path.join(DATA_DIR, 'Throughput_UE_Id_0_499.csv'),
+    'SINR':       os.path.join(DATA_DIR, 'SINRDL_UE_Id_0_499.csv'),
+    'Positions':  os.path.join(DATA_DIR, 'Positions_Salt_Tar_UE_Id_0_499.csv'),
+}
+
+TARGET_COL      = 'Throughput'
+RANDOM_STATE    = 42
+TEST_SIZE       = 0.20
+LOW_PERF_PCTILE = 10
+HURDLE_THRESHOLD = 0.50
+TIME_WINDOW_SIZE = 10
+N_ROWS_LIMIT    = 50_000
+MERGED_FILE     = '/content/master_5g_dataset.csv' if IN_COLAB else 'outputs/merged_5g_dataset.csv'
+
+
+# ============================================================================
+# PART A – DATA LOADING, MELTING & MERGING
+# ============================================================================
+
+section("PART A — LOADING, MELTING & MERGING ALL FILES")
+
+
+def load_and_melt(filepath, metric_name, nrows_wide=None):
+    if not os.path.exists(filepath):
+        print(f"  File not found, skipping: {filepath}")
+        return None
+
+    df = pd.read_csv(filepath, nrows=nrows_wide, sep=None, engine='python')
+
+    if 'time' in df.columns:
+        print(f"  Loaded {metric_name}: {len(df):,} time steps x {len(df.columns)-1} UEs")
+        long = df.melt(id_vars='time', var_name='UE_col', value_name=metric_name)
+        long['UE_id'] = long['UE_col'].str.extract(r'(\d+)').astype(int)
+        return long[['time', 'UE_id', metric_name]]
+
+    if 'timeStamp' in df.columns:
+        print(f"  Loaded Positions: {len(df):,} time steps, parsing UE groups...")
+        records = []
+        cols    = list(df.columns)
+        ue_cols = cols[1:]
+        n_groups = len(ue_cols) // 5
+
+        for row_idx, row in df.iterrows():
+            ts = row['timeStamp']
+            for g in range(n_groups):
+                base = g * 5
+                try:
+                    ue_id  = int(float(str(row[ue_cols[base]]).strip()))
+                    lat    = float(row[ue_cols[base + 1]])
+                    lon    = float(row[ue_cols[base + 2]])
+                    alt    = float(row[ue_cols[base + 3]])
+                    state  = row[ue_cols[base + 4]]
+                    records.append({
+                        'time'        : ts,
+                        'UE_id'       : ue_id,
+                        'Latitude'    : lat,
+                        'Longitude'   : lon,
+                        'Altitude'    : alt,
+                        'MobileState' : str(state).strip(),
+                    })
+                except (ValueError, IndexError):
+                    continue
+
+        pos_df = pd.DataFrame(records)
+        print(f"  Positions parsed: {len(pos_df):,} rows  "
+              f"({pos_df['UE_id'].nunique()} UEs)")
+        return pos_df
+
+    print(f"  Skipping {metric_name}: unrecognised column structure.")
+    print(f"     First 5 columns: {list(df.columns[:5])}")
+    return None
+
+
+WIDE_ROWS = int(np.ceil(N_ROWS_LIMIT / 500)) + 5
+
+print(f"\n  Strategy: read first {WIDE_ROWS} time steps from each file")
+print(f"  -> ~{WIDE_ROWS * 500:,} long rows per file -> merge on (time, UE_id)")
+print(f"  -> aggregate into {TIME_WINDOW_SIZE}-tick windows")
+print(f"  -> target: ~{(WIDE_ROWS // TIME_WINDOW_SIZE) * 500:,} aggregated rows\n")
+
+melted = {}
+
+for name in ['BLER', 'PRBS', 'RU', 'Throughput']:
+    melted[name] = load_and_melt(FILE_PATHS[name], name, nrows_wide=WIDE_ROWS)
+
+for name in ['SINR']:
+    if os.path.exists(FILE_PATHS[name]):
+        melted[name] = load_and_melt(FILE_PATHS[name], name, nrows_wide=WIDE_ROWS)
+        if melted[name] is not None:
+            print(f"  {name} loaded: {len(melted[name]):,} rows")
+    else:
+        print(f"  SINR file not yet available — will be added when uploaded")
+
+pos_df = None
+if os.path.exists(FILE_PATHS['Positions']):
+    pos_df = load_and_melt(FILE_PATHS['Positions'], 'Positions', nrows_wide=WIDE_ROWS)
+    if pos_df is not None:
+        print(f"  Positions loaded: {len(pos_df):,} rows")
+else:
+    print(f"  Positions file not yet available — will be added when uploaded")
+
+available = [k for k, v in melted.items() if v is not None]
+print(f"\n  Merging {len(available)} standard file(s): {available}")
+
+df_merged = melted['Throughput']
+for name in available:
+    if name == 'Throughput':
+        continue
+    df_merged = df_merged.merge(melted[name], on=['time', 'UE_id'], how='inner')
+
+if pos_df is not None:
+    pos_merge = pos_df.rename(columns={'time': 'time'}).copy()
+    df_merged = df_merged.merge(
+        pos_merge[['time', 'UE_id', 'Latitude', 'Longitude', 'Altitude', 'MobileState']],
+        on=['time', 'UE_id'], how='left'
+    )
+    print(f"  Positions merged: Latitude, Longitude, Altitude, MobileState added")
+
+df_merged = df_merged.sort_values(['time', 'UE_id']).reset_index(drop=True)
+
+time_vals    = sorted(df_merged['time'].unique())
+time_rank    = {t: i for i, t in enumerate(time_vals)}
+df_merged['time_rank']   = df_merged['time'].map(time_rank)
+df_merged['time_window'] = df_merged['time_rank'] // TIME_WINDOW_SIZE
+
+agg_rules = {
+    'Throughput': 'sum',
+    'BLER'      : 'mean',
+    'PRBS'      : 'mean',
+    'RU'        : 'mean',
+}
+for col in ['SINR', 'Latitude', 'Longitude', 'Altitude']:
+    if col in df_merged.columns:
+        agg_rules[col] = 'mean'
+if 'MobileState' in df_merged.columns:
+    agg_rules['MobileState'] = lambda x: x.mode()[0] if len(x) > 0 else 'unknown'
+
+agg_rules = {k: v for k, v in agg_rules.items() if k in df_merged.columns}
+
+df_agg = (df_merged
+          .groupby(['UE_id', 'time_window'])
+          .agg(agg_rules)
+          .reset_index())
+
+window_to_time = (df_merged.groupby('time_window')['time'].min()
+                  .reset_index()
+                  .rename(columns={'time': 'time'}))
+df_agg = df_agg.merge(window_to_time, on='time_window', how='left')
+
+n_raw    = len(df_merged)
+n_agg    = len(df_agg)
+zero_raw = (df_merged['Throughput'] == 0).mean() * 100
+zero_agg = (df_agg['Throughput']    == 0).mean() * 100
+
+print(f"\n  Temporal Aggregation Results (window = {TIME_WINDOW_SIZE} ticks)")
+print(f"  Raw rows        : {n_raw:,}   ->  Aggregated rows: {n_agg:,}")
+print(f"  Zero-THP (raw)  : {zero_raw:.1f}%  ->  Zero-THP (agg) : {zero_agg:.1f}%")
+print(f"  Aggregated THP mean: {df_agg['Throughput'].mean():.4f} Mbps")
+print(f"  Aggregated THP (active only): "
+      f"{df_agg[df_agg['Throughput']>0]['Throughput'].mean():.4f} Mbps\n")
+
+df_merged = df_agg.copy()
+
+print(f"\n  Merged dataset shape : {df_merged.shape}")
+print(f"  Time steps  : {df_merged['time'].nunique()} "
+      f"({df_merged['time'].min()} -> {df_merged['time'].max()})")
+print(f"  UE IDs      : {df_merged['UE_id'].nunique()} (0 -> {df_merged['UE_id'].max()})")
+print(f"\n  Column summary:")
+for col in df_merged.columns:
+    s = df_merged[col]
+    nulls = s.isnull().sum()
+    if pd.api.types.is_numeric_dtype(s):
+        print(f"    {col:<20} dtype={str(s.dtype):<10} "
+              f"min={s.min():.3f}  max={s.max():.3f}  "
+              f"mean={s.mean():.3f}  nulls={nulls}")
+    else:
+        uniq = s.dropna().unique()[:4]
+        print(f"    {col:<20} dtype={str(s.dtype):<10} "
+              f"unique values={list(uniq)}  nulls={nulls}")
+
+df_merged.to_csv(MERGED_FILE, index=False)
+print(f"\n  Master dataset saved -> {MERGED_FILE}")
+print(f"  Shape   : {df_merged.shape[0]:,} rows x {df_merged.shape[1]} columns")
+print(f"  Columns : {list(df_merged.columns)}")
+
+if IN_COLAB:
+    print("  To download: Colab sidebar -> Files -> /content/master_5g_dataset.csv -> right-click -> Download")
+
+
+# ============================================================================
+# PART B – FEATURE ENGINEERING
+# ============================================================================
+
+section("PART B — FEATURE ENGINEERING")
+
+df = df_merged.copy()
+
+df['Time_Step']     = df['time']
+df['Time_Norm']     = (df['time'] - df['time'].min()) / (df['time'].max() - df['time'].min())
+
+df['UE_Band'] = pd.cut(df['UE_id'], bins=5,
+                        labels=['Band_0_99','Band_100_199','Band_200_299',
+                                'Band_300_399','Band_400_499'])
+df['UE_Band_Encoded'] = df['UE_Band'].cat.codes
+
+df['BLER_High']     = (df['BLER'] > 0.1).astype(int)
+df['BLER_Category'] = pd.cut(df['BLER'],
+                              bins=[-np.inf, 0, 0.01, 0.1, 0.5, np.inf],
+                              labels=['Zero','Very_Low','Low','Medium','High'])
+df['BLER_Cat_Enc']  = df['BLER_Category'].cat.codes
+
+df['PRBS_Norm']     = df['PRBS'] / df['PRBS'].max()
+df['PRBS_Active']   = (df['PRBS'] > 0).astype(int)
+df['PRBS_High']     = (df['PRBS'] > df['PRBS'].median()).astype(int)
+
+df['RU_Norm']       = (df['RU'] - df['RU'].min()) / (df['RU'].max() - df['RU'].min())
+df['RU_High']       = (df['RU'] > df['RU'].median()).astype(int)
+
+df['Effective_Resource'] = df['PRBS'] * (1 - df['BLER'])
+
+if 'SINR' in df.columns:
+    df['SINR_Norm'] = (df['SINR'] - df['SINR'].min()) / (df['SINR'].max() - df['SINR'].min())
+    df['SINR_Good'] = (df['SINR'] > df['SINR'].median()).astype(int)
+    print("  SINR features created")
+
+if 'Latitude' in df.columns and 'Longitude' in df.columns:
+    ref_lat = df['Latitude'].mean()
+    ref_lon = df['Longitude'].mean()
+    R = 6371000
+    dlat = np.radians(df['Latitude']  - ref_lat)
+    dlon = np.radians(df['Longitude'] - ref_lon)
+    a    = (np.sin(dlat/2)**2 +
+            np.cos(np.radians(ref_lat)) * np.cos(np.radians(df['Latitude']))
+            * np.sin(dlon/2)**2)
+    df['Distance_m'] = R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    df['Distance_m'] = df['Distance_m'].fillna(df['Distance_m'].median())
+    print(f"  Distance_m created  (range: {df['Distance_m'].min():.0f}–"
+          f"{df['Distance_m'].max():.0f} m)")
+
+if 'Altitude' in df.columns:
+    df['Altitude_Norm'] = ((df['Altitude'] - df['Altitude'].min()) /
+                           (df['Altitude'].max() - df['Altitude'].min() + 1e-9))
+    print("  Altitude_Norm created")
+
+if 'MobileState' in df.columns:
+    state_map = {'stationary': 0, 'walking': 1, 'driving': 2}
+    df['MobileState_Enc'] = (df['MobileState'].str.lower()
+                              .map(state_map)
+                              .fillna(1)
+                              .astype(int))
+    print(f"  MobileState_Enc created  "
+          f"(states: {df['MobileState'].unique()[:5]})")
+
+print("  Feature engineering complete")
+print(f"  Dataset shape after feature engineering: {df.shape}")
+
+BASE_FEATURES = ['BLER', 'PRBS', 'RU',
+                 'BLER_High', 'PRBS_Active', 'PRBS_High', 'RU_High',
+                 'PRBS_Norm', 'RU_Norm',
+                 'Effective_Resource', 'UE_id', 'UE_Band_Encoded',
+                 'Time_Norm']
+
+if 'SINR' in df.columns:
+    BASE_FEATURES += ['SINR', 'SINR_Norm', 'SINR_Good']
+
+if 'Distance_m' in df.columns:
+    BASE_FEATURES += ['Distance_m']
+if 'Altitude_Norm' in df.columns:
+    BASE_FEATURES += ['Altitude_Norm']
+if 'MobileState_Enc' in df.columns:
+    BASE_FEATURES += ['MobileState_Enc']
+
+FEATURES = [f for f in BASE_FEATURES if f in df.columns]
+print(f"\n  Features for modelling ({len(FEATURES)}): {FEATURES}")
+
+
+# ============================================================================
+# PART C – EXPLORATORY DATA ANALYSIS
+# ============================================================================
+
+section("PART C — EXPLORATORY DATA ANALYSIS")
+
+EDA_TARGET = TARGET_COL
+KPI_COLS   = [c for c in ['BLER', 'PRBS', 'RU', 'Effective_Resource',
+                            'PRBS_Norm', 'RU_Norm', 'SINR',
+                            'Distance_m', 'Altitude_Norm']
+              if c in df.columns]
+
+hyp_results = []
+
+
+def save_eda(name):
+    filepath = f'outputs/eda/{name}.png'
+    show_and_save(filepath)
+
+
+# ── B1: Correlation Matrix ───────────────────────────────────────────────────
+subsection("B1: Correlation Matrix — KPIs vs DL Throughput")
+
+corr_cols    = [EDA_TARGET] + KPI_COLS
+corr_df      = df[corr_cols].dropna()
+pearson_mat  = corr_df.corr(method='pearson')
+spearman_mat = corr_df.corr(method='spearman')
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+fig.suptitle('B1 — Correlation Matrix: KPIs vs DL Throughput\n'
+             'Pearson r = linear  |  Spearman rho = monotonic / non-linear',
+             fontsize=14, fontweight='bold')
+cmap_div = sns.diverging_palette(220, 20, as_cmap=True)
+for ax, mat, title in zip(axes,
+                           [pearson_mat, spearman_mat],
+                           ['Pearson r  (linear)', 'Spearman rho  (rank)']):
+    mask = np.zeros_like(mat, dtype=bool)
+    np.fill_diagonal(mask, True)
+    sns.heatmap(mat, ax=ax, mask=mask, cmap=cmap_div, center=0,
+                vmin=-1, vmax=1, annot=True, fmt='.2f',
+                annot_kws={'size': 10}, linewidths=0.4, linecolor='white',
+                cbar_kws={'shrink': 0.75, 'label': title})
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.tick_params(axis='x', rotation=45, labelsize=10)
+    ax.tick_params(axis='y', rotation=0,  labelsize=10)
+plt.tight_layout()
+save_eda('b1_correlation_matrix')
+
+target_pearson  = pearson_mat[EDA_TARGET].drop(EDA_TARGET).sort_values(ascending=False)
+target_spearman = spearman_mat[EDA_TARGET].drop(EDA_TARGET).sort_values(ascending=False)
+
+print(f"\n  Pearson r with {EDA_TARGET} (ranked):")
+for feat in target_pearson.index:
+    pr = target_pearson[feat]; sr = target_spearman[feat]
+    strength  = 'STRONG' if abs(pr)>0.5 else 'MODERATE' if abs(pr)>0.3 else 'WEAK'
+    direction = 'positive' if pr > 0 else 'negative'
+    print(f"    {feat:<25}  r={pr:+.3f}  rho={sr:+.3f}  [{strength}, {direction}]")
+
+fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+fig.suptitle('B1 — KPI Pearson Correlation with DL Throughput (ranked)',
+             fontsize=14, fontweight='bold')
+colors = ['#27ae60' if v > 0 else '#e74c3c' for v in target_pearson.values]
+bars   = ax.barh(target_pearson.index, target_pearson.values,
+                 color=colors, edgecolor='white', height=0.6)
+for bar, val in zip(bars, target_pearson.values):
+    xpos = val + 0.005 if val >= 0 else val - 0.005
+    ha   = 'left'      if val >= 0 else 'right'
+    ax.text(xpos, bar.get_y() + bar.get_height()/2,
+            f'{val:+.3f}', va='center', ha=ha, fontsize=10)
+ax.axvline(0,    color='black',   lw=1,   alpha=0.5)
+ax.axvline( 0.3, color='#27ae60', lw=1.2, ls='--', alpha=0.6, label='|r|=0.3 moderate')
+ax.axvline(-0.3, color='#27ae60', lw=1.2, ls='--', alpha=0.6)
+ax.axvline( 0.5, color='#2980b9', lw=1.2, ls=':',  alpha=0.6, label='|r|=0.5 strong')
+ax.axvline(-0.5, color='#2980b9', lw=1.2, ls=':',  alpha=0.6)
+ax.set_xlabel('Pearson r  with  DL Throughput')
+ax.set_title('Green = positive predictor  |  Red = negative predictor')
+ax.legend(fontsize=10); ax.grid(axis='x', alpha=0.3)
+plt.tight_layout()
+save_eda('b1_correlation_ranked_bar')
+
+
+# ── B4: Domain Hypothesis Testing ────────────────────────────────────────────
+subsection("B4: Domain Hypothesis Testing")
+
+
+def hypothesis_scatter(ax, x_col, y_col, title, xlabel,
+                       expected_direction, n_bins=20, color='steelblue'):
+    valid  = df[[x_col, y_col]].dropna()
+    x_vals = valid[x_col]; y_vals = valid[y_col]
+    idx    = valid.sample(min(5000, len(valid)), random_state=42).index
+    ax.scatter(valid.loc[idx, x_col], valid.loc[idx, y_col],
+               alpha=0.08, s=5, color=color)
+    bins  = pd.cut(x_vals, bins=n_bins)
+    means = y_vals.groupby(bins, observed=True).mean()
+    mids  = [(b.left+b.right)/2 for b in means.index]
+    ax.plot(mids, means.values, color='tomato', lw=2.5, label='Bin-mean trend')
+    r, p  = pearsonr(x_vals, y_vals)
+    p_str = 'p < 0.001' if p < 0.001 else f'p = {p:.4f}'
+    confirmed = (r>0.10 and p<0.05) if expected_direction=='positive' \
+                else (r<-0.05 and p<0.05)
+    verdict  = 'CONFIRMED' if confirmed else 'REJECTED'
+    clr_edge = '#27ae60'   if confirmed else '#e74c3c'
+    ax.text(0.04, 0.96, f'Pearson r = {r:+.3f}\n{p_str}\n{verdict}',
+            transform=ax.transAxes, fontsize=9, va='top',
+            bbox=dict(boxstyle='round,pad=0.35', facecolor='white',
+                      edgecolor=clr_edge, alpha=0.92),
+            color=clr_edge, fontweight='bold')
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel('DL Throughput (Mbps)', fontsize=10)
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    ax.legend(fontsize=9); ax.grid(alpha=0.3)
+    return r, p, verdict
+
+
+fig = plt.figure(figsize=(22, 30))
+fig.suptitle('B4 — KPI vs DL Throughput: Hypothesis Testing\n'
+             '5G Simulation Dataset — Telecom-validated relationships',
+             fontsize=15, fontweight='bold', y=1.002)
+
+n_hyp_rows = 4
+gs  = gridspec.GridSpec(n_hyp_rows + 1, 3, figure=fig,
+                        hspace=0.70, wspace=0.38, top=0.97, bottom=0.03)
+pal = ['#3498db','#e74c3c','#9b59b6','#1abc9c','#f39c12','#e67e22','#2ecc71',
+       '#e91e63','#00bcd4']
+
+ax = fig.add_subplot(gs[0, 0])
+if 'SINR' in df.columns:
+    r, p, v = hypothesis_scatter(
+        ax, 'SINR', EDA_TARGET,
+        'H1: SINR up -> Throughput up\nShannon: C = B*log2(1+SINR)',
+        'SINR (dB)', 'positive', color=pal[0])
+    hyp_results.append(('H1: SINR up -> Throughput up', r, p, v,
+                         'Shannon capacity: C=B*log2(1+SINR); SINR drives MCS selection'))
+else:
+    ax.text(0.5, 0.5, 'SINR not yet available\nAdd SINRDL_UE_Id_0_499.csv',
+            transform=ax.transAxes, ha='center', va='center',
+            fontsize=10, color='grey',
+            bbox=dict(boxstyle='round', facecolor='#f8f9fa', edgecolor='grey'))
+    ax.set_title('H1: SINR up -> Throughput up\n(file not yet loaded)',
+                 fontsize=11, fontweight='bold')
+    ax.axis('off')
+
+ax = fig.add_subplot(gs[0, 1])
+r, p, v = hypothesis_scatter(
+    ax, 'PRBS', EDA_TARGET,
+    'H2: PRBs up -> Throughput up\nMore PRBs = more bandwidth',
+    'PRBs Allocated', 'positive', color=pal[1])
+hyp_results.append(('H2: PRBs up -> Throughput up', r, p, v,
+                     'Each PRB = 12 subcarriers; more PRBs -> wider effective bandwidth'))
+
+ax = fig.add_subplot(gs[0, 2])
+r, p, v = hypothesis_scatter(
+    ax, 'BLER', EDA_TARGET,
+    'H3: BLER up -> Throughput down\nHigh BLER -> HARQ retx + lower MCS',
+    'Block Error Rate (BLER)', 'negative', color=pal[2])
+hyp_results.append(('H3: BLER up -> Throughput down', r, p, v,
+                     'BLER > 10% triggers MCS fallback and HARQ retransmissions'))
+
+ax = fig.add_subplot(gs[1, 0])
+r, p, v = hypothesis_scatter(
+    ax, 'RU', EDA_TARGET,
+    'H4: RU up -> Per-UE Throughput down\nHigh cell load -> fewer PRBs per UE',
+    'Resource Utilisation (RU)', 'negative', color=pal[3])
+hyp_results.append(('H4: RU up -> Per-UE Throughput down', r, p, v,
+                     'High RU = congested cell; scheduler allocates fewer PRBs per UE'))
+
+ax = fig.add_subplot(gs[1, 1])
+r, p, v = hypothesis_scatter(
+    ax, 'Effective_Resource', EDA_TARGET,
+    'H5: Effective Resource up -> Throughput up\nPRBs*(1-BLER)',
+    'Effective Resource  PRBs * (1-BLER)', 'positive', color=pal[4])
+hyp_results.append(('H5: Effective Resource up -> Throughput up', r, p, v,
+                     'PRBs*(1-BLER) combines resource quantity and channel quality'))
+
+ax = fig.add_subplot(gs[1, 2])
+active_grp = df[df['PRBS_Active']==1][EDA_TARGET].dropna()
+idle_grp   = df[df['PRBS_Active']==0][EDA_TARGET].dropna()
+bp = ax.boxplot([idle_grp.values, active_grp.values], patch_artist=True,
+                labels=['Unscheduled\n(PRBs = 0)', 'Scheduled\n(PRBs > 0)'],
+                medianprops={'color':'black','lw':2},
+                whiskerprops={'color':'grey'}, capprops={'color':'grey'},
+                flierprops={'marker':'o','ms':2,'alpha':0.15,'color':'grey'})
+bp['boxes'][0].set(facecolor='#e74c3c', alpha=0.7)
+bp['boxes'][1].set(facecolor='#27ae60', alpha=0.7)
+stat, p_val = mannwhitneyu(idle_grp, active_grp, alternative='less')
+v_str    = 'CONFIRMED' if p_val < 0.05 else 'REJECTED'
+clr_edge = '#27ae60' if p_val < 0.05 else '#e74c3c'
+p_str    = 'p < 0.001' if p_val < 0.001 else f'p = {p_val:.4f}'
+ax.text(0.04, 0.96, f'Mann-Whitney\n{p_str}\n{v_str}',
+        transform=ax.transAxes, fontsize=9, va='top',
+        bbox=dict(boxstyle='round,pad=0.35', facecolor='white',
+                  edgecolor=clr_edge, alpha=0.92),
+        color=clr_edge, fontweight='bold')
+ax.set_ylabel('DL Throughput (Mbps)')
+ax.set_title('H6: Scheduled vs Unscheduled UEs\nPRBs=0 -> zero throughput (DTX)',
+             fontsize=11, fontweight='bold')
+ax.grid(axis='y', alpha=0.3)
+hyp_results.append(('H6: Scheduled UEs have higher throughput', np.nan, p_val, v_str,
+                     'PRBs=0 means no scheduling in that TTI; throughput = 0 by definition'))
+
+ax = fig.add_subplot(gs[2, 0])
+if 'Distance_m' in df.columns:
+    r, p, v = hypothesis_scatter(
+        ax, 'Distance_m', EDA_TARGET,
+        'H7: Distance up -> Throughput down\nFriis path loss: P_rx proportional to 1/d^2',
+        'Distance from centroid (m, 99th pctl clipped)', 'negative', color=pal[5])
+    hyp_results.append(('H7: Distance up -> Throughput down', r, p, v,
+                         'Path loss: P_rx proportional to 1/d^2; farther UEs have lower SINR and MCS'))
+else:
+    ax.text(0.5, 0.5, 'Positions not yet available\nAdd Positions file',
+            transform=ax.transAxes, ha='center', va='center',
+            fontsize=10, color='grey',
+            bbox=dict(boxstyle='round', facecolor='#f8f9fa', edgecolor='grey'))
+    ax.set_title('H7: Distance up -> Throughput down\n(Positions file not yet loaded)',
+                 fontsize=11, fontweight='bold')
+    ax.axis('off')
+
+ax = fig.add_subplot(gs[2, 1])
+if 'MobileState_Enc' in df.columns and 'MobileState' in df.columns:
+    state_order  = ['stationary', 'walking', 'driving']
+    state_groups = [df[df['MobileState'].str.lower()==s][EDA_TARGET].dropna().values
+                    for s in state_order
+                    if s in df['MobileState'].str.lower().values]
+    state_labels = [s.capitalize() for s in state_order
+                    if s in df['MobileState'].str.lower().values]
+    if len(state_groups) >= 2:
+        vp = ax.violinplot(state_groups, positions=range(len(state_labels)),
+                           showmedians=True, showextrema=True, widths=0.7)
+        mob_colors = ['#27ae60','#3498db','#e74c3c']
+        for i, body in enumerate(vp['bodies']):
+            body.set_facecolor(mob_colors[i % len(mob_colors)]); body.set_alpha(0.65)
+        vp['cmedians'].set_color('black'); vp['cmedians'].set_linewidth(2)
+        ax.set_xticks(range(len(state_labels)))
+        ax.set_xticklabels(state_labels)
+        stat_kw, p_kw = kruskal(*state_groups)
+        v8 = 'CONFIRMED' if p_kw < 0.05 else 'REJECTED'
+        clr8 = '#27ae60' if 'CONFIRMED' in v8 else '#e74c3c'
+        p8_str = 'p < 0.001' if p_kw < 0.001 else f'p = {p_kw:.4f}'
+        ax.text(0.04, 0.96, f'Kruskal-Wallis\n{p8_str}\n{v8}',
+                transform=ax.transAxes, fontsize=9, va='top',
+                bbox=dict(boxstyle='round,pad=0.35', facecolor='white',
+                          edgecolor=clr8, alpha=0.92),
+                color=clr8, fontweight='bold')
+        ax.set_ylabel('DL Throughput (Mbps)')
+        ax.set_title('H8: Mobility up -> Throughput down\nDoppler effect',
+                     fontsize=11, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3)
+        hyp_results.append(('H8: Mobility up -> Throughput down', np.nan, p_kw, v8,
+                             'Doppler effect: moving UEs have stale CQI; driving = worst'))
+    else:
+        ax.text(0.5, 0.5, 'Insufficient mobility categories', transform=ax.transAxes,
+                ha='center', va='center', fontsize=10, color='grey')
+        ax.axis('off')
+else:
+    ax.text(0.5, 0.5, 'Positions not yet available',
+            transform=ax.transAxes, ha='center', va='center',
+            fontsize=10, color='grey',
+            bbox=dict(boxstyle='round', facecolor='#f8f9fa', edgecolor='grey'))
+    ax.set_title('H8: Mobility up -> Throughput down\n(Positions file not yet loaded)',
+                 fontsize=11, fontweight='bold')
+    ax.axis('off')
+
+ax = fig.add_subplot(gs[2, 2])
+bler_cats  = ['Zero','Very_Low','Low','Medium','High']
+bler_means = [df[df['BLER_Category']==c][EDA_TARGET].mean() for c in bler_cats
+              if c in df['BLER_Category'].values]
+bler_stds  = [df[df['BLER_Category']==c][EDA_TARGET].std()  for c in bler_cats
+              if c in df['BLER_Category'].values]
+bler_lbls  = [c.replace('_',' ') for c in bler_cats if c in df['BLER_Category'].values]
+bar_cols   = ['#27ae60','#3498db','#f39c12','#e67e22','#e74c3c'][:len(bler_lbls)]
+ax.bar(bler_lbls, bler_means, yerr=bler_stds, color=bar_cols,
+       alpha=0.85, edgecolor='white', capsize=4,
+       error_kw={'ecolor':'grey','alpha':0.5})
+ax.set_xlabel('BLER Severity Category')
+ax.set_ylabel('Mean DL Throughput (Mbps)  +/- 1 std')
+ax.set_title('H9: BLER Severity -> Throughput down',
+             fontsize=11, fontweight='bold')
+ax.grid(axis='y', alpha=0.3)
+r9, p9 = pearsonr(df['BLER_Cat_Enc'], df[EDA_TARGET])
+v9 = 'CONFIRMED' if r9 < -0.05 and p9 < 0.05 else 'REJECTED'
+clr9 = '#27ae60' if 'CONFIRMED' in v9 else '#e74c3c'
+p9_str = 'p < 0.001' if p9 < 0.001 else f'p={p9:.4f}'
+ax.text(0.96, 0.96, f'r={r9:+.3f}\n{p9_str}\n{v9}',
+        transform=ax.transAxes, fontsize=9, va='top', ha='right',
+        bbox=dict(boxstyle='round,pad=0.35', facecolor='white',
+                  edgecolor=clr9, alpha=0.92),
+        color=clr9, fontweight='bold')
+hyp_results.append(('H9: BLER severity up -> Throughput down', r9, p9, v9,
+                     'Categorical view confirms BLER-THP inverse relationship'))
+
+ax_tbl = fig.add_subplot(gs[3, :])
+ax_tbl.axis('off')
+if hyp_results:
+    col_labels = ['Hypothesis', 'Telecom Rationale', 'Pearson r', 'p-value', 'Verdict']
+    rows = []
+    for h, r, p, v, rationale in hyp_results:
+        r_str = f'{r:+.3f}' if not np.isnan(r) else 'N/A'
+        p_str = 'p < 0.001' if p < 0.001 else f'p = {p:.4f}'
+        rows.append([h, rationale, r_str, p_str, v])
+    tbl = ax_tbl.table(cellText=rows, colLabels=col_labels,
+                       cellLoc='center', loc='center', bbox=[0.0, 0.0, 1.0, 1.0])
+    tbl.auto_set_font_size(False); tbl.set_fontsize(9)
+    tbl.auto_set_column_width([0, 1, 2, 3, 4])
+    for (ri, ci), cell in tbl.get_celld().items():
+        if ri == 0:
+            cell.set_facecolor('#2c3e50')
+            cell.set_text_props(color='white', fontweight='bold')
+        else:
+            txt = cell.get_text().get_text()
+            cell.set_facecolor('#d5f5e3' if 'CONFIRMED' in txt else
+                               '#fadbd8' if 'REJECTED' in txt else '#f8f9fa')
+            cell.set_text_props(
+                color='#27ae60' if 'CONFIRMED' in txt else
+                      '#e74c3c' if 'REJECTED' in txt else 'black',
+                fontweight='bold' if ('CONFIRMED' in txt or 'REJECTED' in txt) else 'normal')
+        cell.set_edgecolor('#bdc3c7')
+    ax_tbl.set_title('Hypothesis Testing Summary — KPI vs DL Throughput',
+                     pad=6, fontsize=12, fontweight='bold')
+plt.tight_layout()
+save_eda('b4_hypothesis_testing')
+
+
+# ── B5: KPI vs Throughput Scatter Panels ─────────────────────────────────────
+subsection("B5: KPI vs DL Throughput Scatter Analysis")
+
+
+def kpi_scatter_slide(x_col, y_col, xlabel, title, color,
+                      active_only=False, filename=None):
+    data = df[df[y_col] > 0] if active_only else df
+    fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+    idx  = data.sample(min(5000, len(data)), random_state=42).index
+    ax.scatter(data.loc[idx, x_col], data.loc[idx, y_col],
+               alpha=0.18, s=10, color=color)
+    bins  = pd.cut(data[x_col], bins=20)
+    means = data.groupby(bins, observed=True)[y_col].mean()
+    mids  = [(b.left+b.right)/2 for b in means.index]
+    ax.plot(mids, means.values, color='tomato', lw=2.8, label='Bin-mean trend')
+    r, p = pearsonr(data[x_col], data[y_col])
+    p_str = 'p < 0.001' if p < 0.001 else f'p = {p:.4f}'
+    ax.text(0.04, 0.96, f'Pearson r = {r:+.3f}\n{p_str}',
+            transform=ax.transAxes, fontsize=11, va='top',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                      edgecolor='grey', alpha=0.88))
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel('DL Throughput (Mbps)')
+    ax.set_title(title, fontweight='bold', pad=12)
+    ax.legend(fontsize=10); ax.grid(alpha=0.25)
+    plt.tight_layout()
+    fname = filename or f"b5_scatter_{x_col.lower().replace(' ','_')}"
+    save_eda(fname)
+
+
+def placeholder_slide(title, msg, filename):
+    fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+    ax.text(0.5, 0.5, msg, transform=ax.transAxes,
+            ha='center', va='center', fontsize=13, color='grey',
+            bbox=dict(boxstyle='round', facecolor='#f8f9fa', edgecolor='grey'))
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.axis('off')
+    plt.tight_layout()
+    save_eda(filename)
+
+
+if 'SINR' in df.columns:
+    kpi_scatter_slide('SINR', EDA_TARGET, 'SINR (dB)',
+                      'B5 — SINR vs DL Throughput\nShannon: C = B*log2(1+SINR)',
+                      '#3498db', active_only=True, filename='b5_scatter_sinr')
+else:
+    placeholder_slide('B5 — SINR vs DL Throughput\n(file not yet loaded)',
+                      'Add SINRDL_UE_Id_0_499.csv\nto enable this panel',
+                      'b5_scatter_sinr_placeholder')
+
+kpi_scatter_slide('PRBS', EDA_TARGET, 'PRBs Allocated',
+                  'B5 — PRBs vs DL Throughput\nMore PRBs = wider bandwidth',
+                  '#9b59b6', filename='b5_scatter_prbs')
+
+kpi_scatter_slide('BLER', EDA_TARGET, 'Block Error Rate (BLER)',
+                  'B5 — BLER vs DL Throughput (active UEs)\nHigh BLER -> retx + MCS fallback',
+                  '#e74c3c', active_only=True, filename='b5_scatter_bler')
+
+kpi_scatter_slide('RU', EDA_TARGET, 'Resource Utilisation (RU)',
+                  'B5 — RU vs DL Throughput\nHigh RU = congested cell',
+                  '#e67e22', filename='b5_scatter_ru')
+
+if 'Distance_m' in df.columns:
+    tmp = df.copy()
+    tmp['Distance_m'] = df['Distance_m'].clip(upper=df['Distance_m'].quantile(0.99))
+    fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+    idx_d = tmp.sample(min(5000, len(tmp)), random_state=42).index
+    ax.scatter(tmp.loc[idx_d, 'Distance_m'], tmp.loc[idx_d, EDA_TARGET],
+               alpha=0.18, s=10, color='#1abc9c')
+    bins_d  = pd.cut(tmp['Distance_m'], bins=20)
+    means_d = tmp.groupby(bins_d, observed=True)[EDA_TARGET].mean()
+    mids_d  = [(b.left+b.right)/2 for b in means_d.index]
+    ax.plot(mids_d, means_d.values, color='tomato', lw=2.8, label='Bin-mean trend')
+    r_d, p_d = pearsonr(tmp['Distance_m'], tmp[EDA_TARGET])
+    p_d_str = 'p < 0.001' if p_d < 0.001 else f'p = {p_d:.4f}'
+    ax.text(0.04, 0.96, f'Pearson r = {r_d:+.3f}\n{p_d_str}',
+            transform=ax.transAxes, fontsize=11, va='top',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                      edgecolor='grey', alpha=0.88))
+    ax.set_xlabel('Distance from centroid (m, 99th pctl clipped)')
+    ax.set_ylabel('DL Throughput (Mbps)')
+    ax.set_title('B5 — Distance vs DL Throughput\nFriis: P_rx proportional to 1/d^2 -> SINR down -> MCS down',
+                 fontweight='bold', pad=12)
+    ax.legend(fontsize=10); ax.grid(alpha=0.25)
+    plt.tight_layout()
+    save_eda('b5_scatter_distance')
+else:
+    placeholder_slide('B5 — Distance vs DL Throughput\n(Positions file not yet loaded)',
+                      'Add Positions_Salt_Tar_UE_Id_0_499.csv\nto enable this panel',
+                      'b5_scatter_distance_placeholder')
+
+kpi_scatter_slide('Effective_Resource', EDA_TARGET,
+                  'Effective Resource  PRBs * (1-BLER)',
+                  'B5 — Effective Resource vs DL Throughput\nComposite: quantity * quality',
+                  '#27ae60', filename='b5_scatter_effective_resource')
+
+
+# ── B6: EDA Summary Report ───────────────────────────────────────────────────
+subsection("B6: EDA Summary Report")
+
+sinr_insight = (
+    "   - SINR is present and is the strongest positive predictor of throughput"
+    if 'SINR' in df.columns
+    else
+    "   - SINR file not yet loaded — add SINRDL_UE_Id_0_499.csv to include it."
+)
+
+report_lines = [
+    "="*72,
+    "5G SIMULATION THROUGHPUT PREDICTION — EDA SUMMARY REPORT",
+    "  ARCHITECTURE: TWO-STAGE HURDLE MODEL",
+    "="*72,
+    f"Generated   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    f"Dataset     : {len(df):,} rows x {len(df.columns)} columns",
+    f"Source files: BLER | PRBS | RU | Throughput"
+    + (" | SINR" if 'SINR' in df.columns else " | [SINR not loaded]"),
+    f"Time range  : {df['time'].min()} -> {df['time'].max()} "
+    f"({df['time'].nunique()} time steps)",
+    f"UE IDs      : 0 -> {df['UE_id'].max()} ({df['UE_id'].nunique()} UEs)",
+    f"Target      : {EDA_TARGET} (DL Throughput in Mbps)", "",
+    "-"*72, "1. TARGET VARIABLE (DL Throughput) — FULL POPULATION", "-"*72,
+    f"   Mean      : {df[EDA_TARGET].mean():.4f} Mbps  (includes zeros)",
+    f"   Median    : {df[EDA_TARGET].median():.4f} Mbps",
+    f"   Std Dev   : {df[EDA_TARGET].std():.4f} Mbps",
+    f"   Min/Max   : {df[EDA_TARGET].min():.4f} / {df[EDA_TARGET].max():.4f} Mbps",
+    f"   Skewness  : {df[EDA_TARGET].skew():.3f}",
+    f"   Zero rows : {(df[EDA_TARGET]==0).sum():,} "
+    f"({(df[EDA_TARGET]==0).mean()*100:.1f}%)  <- modelled by Hurdle Stage 1",
+    f"   Active rows: {(df[EDA_TARGET]>0).sum():,} "
+    f"({(df[EDA_TARGET]>0).mean()*100:.1f}%)  <- used for Hurdle Stage 2",
+]
+report_text = "\n".join(report_lines)
+with open('outputs/eda/eda_summary_report.txt', 'w') as f:
+    f.write(report_text)
+print("\n" + report_text)
+print("\nEDA complete — all outputs saved to outputs/eda/")
+
+
+# ============================================================================
+# PART D – MODEL PIPELINE  (HURDLE ARCHITECTURE)
+# ============================================================================
+
+section("PART D — MODEL PIPELINE  [TWO-STAGE HURDLE MODEL]")
+
+print("""
+  ALL ROWS  ->  Hurdle Stage 1 (Binary Classifier: is_scheduled?)
+                     |
+         +-----------+-----------+
+         |                       |
+    p < threshold           p >= threshold
+  predicted THP = 0      Hurdle Stage 2 (Regressor: predicted THP = y Mbps)
+
+  Stage 3 (unchanged): Anomaly classifier on active UEs only
+""")
+
+data_full = df[FEATURES + [TARGET_COL]].dropna()
+
+n_total     = len(data_full)
+n_zero      = (data_full[TARGET_COL] == 0).sum()
+n_active    = (data_full[TARGET_COL] > 0).sum()
+pct_zero    = n_zero   / n_total * 100
+pct_active  = n_active / n_total * 100
+
+print(f"\n  Full-Population Label Summary")
+print(f"  Total rows              : {n_total:,}")
+print(f"  Unscheduled (THP == 0)  : {n_zero:,}  ({pct_zero:.1f}%)")
+print(f"  Active      (THP >  0)  : {n_active:,}  ({pct_active:.1f}%)")
+
+data_full = data_full.copy()
+data_full['is_scheduled'] = (data_full[TARGET_COL] > 0).astype(int)
+
+X_full = data_full[FEATURES]
+y_full = data_full[TARGET_COL]
+y_hurdle = data_full['is_scheduled']
+
+data_active = data_full[data_full[TARGET_COL] > 0].copy()
+X_active    = data_active[FEATURES]
+y_active    = data_active[TARGET_COL]
+
+section("TRAIN / TEST SPLIT  (80 / 20)")
+(X_train_full, X_test_full,
+ y_train_hurdle, y_test_hurdle,
+ y_train_full, y_test_full) = train_test_split(
+    X_full, y_hurdle, y_full,
+    test_size=TEST_SIZE, random_state=RANDOM_STATE)
+
+train_active_mask = y_train_full > 0
+test_active_mask  = y_test_full  > 0
+
+X_train_reg = X_train_full[train_active_mask]
+y_train_reg = y_train_full[train_active_mask]
+X_test_reg  = X_test_full[test_active_mask]
+y_test_reg  = y_test_full[test_active_mask]
+
+print(f"  Full split    — Train: {len(X_train_full):,}  Test: {len(X_test_full):,}")
+print(f"  Active subset — Train: {len(X_train_reg):,}  Test: {len(X_test_reg):,}")
+print(f"  Hurdle labels — Train pos: {y_train_hurdle.sum():,}  "
+      f"Train neg: {(y_train_hurdle==0).sum():,}")
+
+
+# ============================================================================
+# HURDLE STAGE 1 – SCHEDULING CLASSIFIER
+# ============================================================================
+section("HURDLE STAGE 1 — SCHEDULING CLASSIFIER")
+
+if USE_SMOTE:
+    minority_h = (y_train_hurdle == 1).sum()
+    k_h        = min(5, minority_h - 1)
+    if k_h >= 1:
+        X_tr_h, y_tr_h = SMOTE(random_state=RANDOM_STATE,
+                                 k_neighbors=k_h).fit_resample(
+                                 X_train_full, y_train_hurdle)
+        print(f"  SMOTE applied — Train after: pos={y_tr_h.sum():,} neg={(y_tr_h==0).sum():,}")
+    else:
+        X_tr_h, y_tr_h = X_train_full, y_train_hurdle
+else:
+    X_tr_h, y_tr_h = X_train_full, y_train_hurdle
+
+pos_w_hurdle = (y_tr_h==0).sum() / max((y_tr_h==1).sum(), 1)
+
+subsection("Hurdle Stage 1 — Model A: Random Forest Classifier")
+h1_rf = RandomForestClassifier(n_estimators=200, max_depth=15,
+                                min_samples_split=5, min_samples_leaf=2,
+                                class_weight='balanced', max_features='sqrt',
+                                n_jobs=-1, random_state=RANDOM_STATE)
+h1_rf.fit(X_tr_h, y_tr_h)
+h1_rf_pred  = h1_rf.predict(X_test_full)
+h1_rf_proba = h1_rf.predict_proba(X_test_full)[:, 1]
+print(classification_report(y_test_hurdle, h1_rf_pred,
+                             target_names=['Unscheduled','Scheduled']))
+h1_rf_auc = roc_auc_score(y_test_hurdle, h1_rf_proba)
+print(f"  ROC-AUC: {h1_rf_auc:.4f}")
+
+subsection(f"Hurdle Stage 1 — Model B: {XGB_LABEL} Classifier")
+if USE_XGB:
+    h1_xgb = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
+                            subsample=0.8, colsample_bytree=0.8,
+                            scale_pos_weight=pos_w_hurdle,
+                            use_label_encoder=False, eval_metric='logloss',
+                            n_jobs=-1, random_state=RANDOM_STATE, verbosity=0)
+    h1_xgb.fit(X_tr_h, y_tr_h, eval_set=[(X_test_full, y_test_hurdle)], verbose=False)
+else:
+    h1_xgb = XGBClassifier(n_estimators=150, max_depth=5, learning_rate=0.1,
+                            subsample=0.8, random_state=RANDOM_STATE)
+    h1_xgb.fit(X_tr_h, y_tr_h)
+h1_xgb_pred  = h1_xgb.predict(X_test_full)
+h1_xgb_proba = h1_xgb.predict_proba(X_test_full)[:, 1]
+print(classification_report(y_test_hurdle, h1_xgb_pred,
+                             target_names=['Unscheduled','Scheduled']))
+h1_xgb_auc = roc_auc_score(y_test_hurdle, h1_xgb_proba)
+print(f"  ROC-AUC: {h1_xgb_auc:.4f}")
+
+subsection(f"Hurdle Stage 1 — Model C: {LGBM_LABEL} Classifier")
+if USE_LGBM:
+    h1_lgbm = LGBMClassifier(n_estimators=300, max_depth=8, learning_rate=0.05,
+                              num_leaves=63, min_child_samples=20, subsample=0.8,
+                              colsample_bytree=0.8, scale_pos_weight=pos_w_hurdle,
+                              class_weight='balanced', n_jobs=-1,
+                              random_state=RANDOM_STATE, verbose=-1)
+else:
+    h1_lgbm = LGBMClassifier(n_estimators=150, max_depth=5, learning_rate=0.1,
+                              subsample=0.8, random_state=RANDOM_STATE)
+h1_lgbm.fit(X_tr_h, y_tr_h)
+h1_lgbm_pred  = h1_lgbm.predict(X_test_full)
+h1_lgbm_proba = h1_lgbm.predict_proba(X_test_full)[:, 1]
+print(classification_report(y_test_hurdle, h1_lgbm_pred,
+                             target_names=['Unscheduled','Scheduled']))
+h1_lgbm_auc = roc_auc_score(y_test_hurdle, h1_lgbm_proba)
+print(f"  ROC-AUC: {h1_lgbm_auc:.4f}")
+
+best_h1_auc  = max(h1_rf_auc, h1_xgb_auc, h1_lgbm_auc)
+if   h1_xgb_auc  >= h1_rf_auc and h1_xgb_auc  >= h1_lgbm_auc:
+    best_h1_name  = XGB_LABEL;      best_h1_model = h1_xgb
+    best_h1_proba = h1_xgb_proba;   best_h1_pred  = h1_xgb_pred
+elif h1_lgbm_auc >= h1_rf_auc:
+    best_h1_name  = LGBM_LABEL;     best_h1_model = h1_lgbm
+    best_h1_proba = h1_lgbm_proba;  best_h1_pred  = h1_lgbm_pred
+else:
+    best_h1_name  = 'Random Forest'; best_h1_model = h1_rf
+    best_h1_proba = h1_rf_proba;     best_h1_pred  = h1_rf_pred
+
+print(f"\n  Best Hurdle Stage 1: {best_h1_name}  (AUC = {best_h1_auc:.4f})")
+joblib.dump(best_h1_model, f'outputs/models/hurdle_stage1_{best_h1_name.replace(" ","_")}.pkl')
+
+
+# ============================================================================
+# HURDLE STAGE 2 – THROUGHPUT REGRESSOR
+# ============================================================================
+section("HURDLE STAGE 2 — THROUGHPUT REGRESSOR  (active rows only)")
+
+subsection("Hurdle Stage 2 — Model A: Random Forest Regressor")
+h2_rf = RandomForestRegressor(n_estimators=200, max_depth=20,
+                               min_samples_split=5, min_samples_leaf=2,
+                               max_features='sqrt', n_jobs=-1,
+                               random_state=RANDOM_STATE)
+h2_rf.fit(X_train_reg, y_train_reg)
+h2_rf_pred = h2_rf.predict(X_test_reg)
+h2_rf_m = {'TrainR2': r2_score(y_train_reg, h2_rf.predict(X_train_reg)),
+            'TestR2' : r2_score(y_test_reg, h2_rf_pred),
+            'RMSE'   : np.sqrt(mean_squared_error(y_test_reg, h2_rf_pred)),
+            'MAE'    : mean_absolute_error(y_test_reg, h2_rf_pred)}
+for k, v in h2_rf_m.items(): print(f"    {k:<10}: {v:.4f}")
+
+subsection(f"Hurdle Stage 2 — Model B: {XGB_LABEL} Regressor")
+if USE_XGB:
+    h2_xgb = XGBRegressor(n_estimators=300, max_depth=8, learning_rate=0.05,
+                           subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1,
+                           reg_lambda=1.0, n_jobs=-1, random_state=RANDOM_STATE,
+                           verbosity=0)
+    h2_xgb.fit(X_train_reg, y_train_reg,
+               eval_set=[(X_test_reg, y_test_reg)], verbose=False)
+else:
+    h2_xgb = XGBRegressor(n_estimators=200, max_depth=6, learning_rate=0.1,
+                           subsample=0.8, random_state=RANDOM_STATE)
+    h2_xgb.fit(X_train_reg, y_train_reg)
+h2_xgb_pred = h2_xgb.predict(X_test_reg)
+h2_xgb_m = {'TrainR2': r2_score(y_train_reg, h2_xgb.predict(X_train_reg)),
+             'TestR2' : r2_score(y_test_reg, h2_xgb_pred),
+             'RMSE'   : np.sqrt(mean_squared_error(y_test_reg, h2_xgb_pred)),
+             'MAE'    : mean_absolute_error(y_test_reg, h2_xgb_pred)}
+for k, v in h2_xgb_m.items(): print(f"    {k:<10}: {v:.4f}")
+
+subsection(f"Hurdle Stage 2 — Model C: {LGBM_LABEL} Regressor")
+if USE_LGBM:
+    h2_lgbm = LGBMRegressor(n_estimators=300, max_depth=8, learning_rate=0.05,
+                             num_leaves=63, min_child_samples=20, subsample=0.8,
+                             colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+                             n_jobs=-1, random_state=RANDOM_STATE, verbose=-1)
+else:
+    h2_lgbm = LGBMRegressor(n_estimators=200, max_depth=6, learning_rate=0.1,
+                             subsample=0.8, random_state=RANDOM_STATE)
+h2_lgbm.fit(X_train_reg, y_train_reg)
+h2_lgbm_pred = np.clip(h2_lgbm.predict(X_test_reg), 0, None)
+h2_lgbm_m = {'TrainR2': r2_score(y_train_reg, np.clip(h2_lgbm.predict(X_train_reg), 0, None)),
+              'TestR2' : r2_score(y_test_reg, h2_lgbm_pred),
+              'RMSE'   : np.sqrt(mean_squared_error(y_test_reg, h2_lgbm_pred)),
+              'MAE'    : mean_absolute_error(y_test_reg, h2_lgbm_pred)}
+for k, v in h2_lgbm_m.items(): print(f"    {k:<10}: {v:.4f}")
+
+if   h2_xgb_m['TestR2']  >= h2_rf_m['TestR2'] and h2_xgb_m['TestR2']  >= h2_lgbm_m['TestR2']:
+    best_h2_name  = XGB_LABEL;       best_h2_model = h2_xgb;  best_h2_pred = h2_xgb_pred;  best_h2_m = h2_xgb_m
+elif h2_lgbm_m['TestR2'] >= h2_rf_m['TestR2']:
+    best_h2_name  = LGBM_LABEL;      best_h2_model = h2_lgbm; best_h2_pred = h2_lgbm_pred; best_h2_m = h2_lgbm_m
+else:
+    best_h2_name  = 'Random Forest'; best_h2_model = h2_rf;   best_h2_pred = h2_rf_pred;   best_h2_m = h2_rf_m
+
+print(f"\n  Best Hurdle Stage 2: {best_h2_name}  "
+      f"(R2 = {best_h2_m['TestR2']:.4f}  RMSE = {best_h2_m['RMSE']:.4f})")
+joblib.dump(best_h2_model, f'outputs/models/hurdle_stage2_{best_h2_name.replace(" ","_")}.pkl')
+
+
+# ============================================================================
+# COMBINED HURDLE EVALUATION
+# ============================================================================
+section("COMBINED HURDLE EVALUATION — Full test-set R2 (zeros included)")
+
+def hurdle_predict_full(X_test_all, y_test_all,
+                        h1_model, h2_model, h2_models_dict,
+                        threshold=HURDLE_THRESHOLD, label='Best models'):
+    proba     = h1_model.predict_proba(X_test_all)[:, 1]
+    scheduled = proba >= threshold
+    y_hat     = np.zeros(len(X_test_all))
+
+    if scheduled.sum() > 0:
+        reg_preds          = np.clip(h2_model.predict(X_test_all[scheduled]), 0, None)
+        y_hat[scheduled]   = reg_preds
+
+    r2_combined   = r2_score(y_test_all, y_hat)
+    rmse_combined = np.sqrt(mean_squared_error(y_test_all, y_hat))
+    mae_combined  = mean_absolute_error(y_test_all, y_hat)
+
+    pred_sched = (proba >= threshold).astype(int)
+    true_sched = (y_test_all > 0).astype(int)
+    gate_auc   = roc_auc_score(true_sched, proba)
+
+    print(f"\n  [{label}]")
+    print(f"  Hurdle gate AUC              : {gate_auc:.4f}")
+    print(f"  Scheduled rows predicted     : {scheduled.sum():,} / {len(X_test_all):,} "
+          f"({scheduled.mean()*100:.1f}%)")
+    print(f"  Combined R2  (full pop.)     : {r2_combined:.4f}   <- KEY METRIC")
+    print(f"  Combined RMSE (full pop.)    : {rmse_combined:.4f} Mbps")
+    print(f"  Combined MAE  (full pop.)    : {mae_combined:.4f} Mbps")
+
+    return {
+        'y_hat': y_hat, 'proba': proba, 'scheduled': scheduled,
+        'r2': r2_combined, 'rmse': rmse_combined, 'mae': mae_combined,
+        'gate_auc': gate_auc
+    }
+
+
+hurdle_results = {}
+
+for tag, h1_m, h2_m in [
+    ('Random Forest', h1_rf,   h2_rf),
+    (XGB_LABEL,       h1_xgb,  h2_xgb),
+    (LGBM_LABEL,      h1_lgbm, h2_lgbm),
+]:
+    res = hurdle_predict_full(
+        X_test_full.values if hasattr(X_test_full, 'values') else X_test_full,
+        y_test_full.values if hasattr(y_test_full, 'values') else y_test_full,
+        h1_m, h2_m, {}, threshold=HURDLE_THRESHOLD, label=tag)
+    hurdle_results[tag] = res
+
+best_hurdle_tag = max(hurdle_results, key=lambda k: hurdle_results[k]['r2'])
+best_hurdle     = hurdle_results[best_hurdle_tag]
+print(f"\n  Best hurdle combo: {best_hurdle_tag}  "
+      f"(combined R2 = {best_hurdle['r2']:.4f})")
+
+
+# ============================================================================
+# ANOMALY LABELS  (Stage 3)
+# ============================================================================
+section(f"STAGE 3 ANOMALY LABELS  (bottom {LOW_PERF_PCTILE}th percentile of active samples)")
+
+pctile = LOW_PERF_PCTILE
+while pctile <= 90:
+    threshold_anom = np.percentile(y_train_reg, pctile)
+    y_cls_train    = (y_train_reg < threshold_anom).astype(int)
+    if y_cls_train.nunique() == 2:
+        break
+    pctile += 5
+
+if y_cls_train.nunique() < 2:
+    threshold_anom = y_train_reg.median()
+    y_cls_train    = (y_train_reg < threshold_anom).astype(int)
+
+y_cls_test = (y_test_reg < threshold_anom).astype(int)
+print(f"  Threshold : {threshold_anom:.4f} Mbps")
+print(f"  Train  ->  Normal: {(y_cls_train==0).sum():,}  "
+      f"|  Anomaly: {(y_cls_train==1).sum():,}")
+
+if USE_SMOTE:
+    subsection("Handling Imbalance with SMOTE")
+    minority_count = (y_cls_train == 1).sum()
+    k_neighbors    = min(5, minority_count - 1)
+    if k_neighbors >= 1:
+        X_tr_bal, y_tr_bal = SMOTE(random_state=RANDOM_STATE,
+                                    k_neighbors=k_neighbors).fit_resample(
+                                    X_train_reg, y_cls_train)
+        print(f"  After SMOTE -> Normal: {(y_tr_bal==0).sum():,}  "
+              f"|  Anomaly: {(y_tr_bal==1).sum():,}")
+    else:
+        X_tr_bal, y_tr_bal = X_train_reg, y_cls_train
+else:
+    X_tr_bal, y_tr_bal = X_train_reg, y_cls_train
+
+pos_w = (y_tr_bal==0).sum() / max((y_tr_bal==1).sum(), 1)
+
+
+# ============================================================================
+# STAGE 3 – ANOMALY CLASSIFICATION
+# ============================================================================
+section("STAGE 3 — ANOMALY CLASSIFICATION: Flagging Low-Performance UEs")
+
+subsection("Stage 3 — Model A: Random Forest Classifier")
+rf_cls = RandomForestClassifier(n_estimators=200, max_depth=15,
+                                 min_samples_split=5, min_samples_leaf=2,
+                                 class_weight='balanced', max_features='sqrt',
+                                 n_jobs=-1, random_state=RANDOM_STATE)
+rf_cls.fit(X_tr_bal, y_tr_bal)
+rf_cp  = rf_cls.predict(X_test_reg)
+_proba = rf_cls.predict_proba(X_test_reg)
+rf_cpr = _proba[:,1] if _proba.shape[1] > 1 else _proba[:,0]
+print(classification_report(y_cls_test, rf_cp, target_names=["Normal","Low-Performance"]))
+rf_auc = roc_auc_score(y_cls_test, rf_cpr)
+print(f"  ROC-AUC: {rf_auc:.4f}")
+
+subsection(f"Stage 3 — Model B: {XGB_LABEL} Classifier")
+if USE_XGB:
+    xgb_cls = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
+                             subsample=0.8, colsample_bytree=0.8,
+                             scale_pos_weight=pos_w, use_label_encoder=False,
+                             eval_metric='logloss', n_jobs=-1,
+                             random_state=RANDOM_STATE, verbosity=0)
+    xgb_cls.fit(X_tr_bal, y_tr_bal, eval_set=[(X_test_reg, y_cls_test)], verbose=False)
+else:
+    xgb_cls = XGBClassifier(n_estimators=150, max_depth=5, learning_rate=0.1,
+                             subsample=0.8, random_state=RANDOM_STATE)
+    xgb_cls.fit(X_tr_bal, y_tr_bal)
+xgb_cp  = xgb_cls.predict(X_test_reg)
+_proba2 = xgb_cls.predict_proba(X_test_reg)
+xgb_cpr = _proba2[:,1] if _proba2.shape[1] > 1 else _proba2[:,0]
+print(classification_report(y_cls_test, xgb_cp, target_names=["Normal","Low-Performance"]))
+xgb_auc = roc_auc_score(y_cls_test, xgb_cpr)
+print(f"  ROC-AUC: {xgb_auc:.4f}")
+
+subsection(f"Stage 3 — Model C: {LGBM_LABEL} Classifier")
+if USE_LGBM:
+    lgbm_cls = LGBMClassifier(n_estimators=300, max_depth=8, learning_rate=0.05,
+                               num_leaves=63, min_child_samples=20, subsample=0.8,
+                               colsample_bytree=0.8, scale_pos_weight=pos_w,
+                               class_weight='balanced', reg_alpha=0.1,
+                               reg_lambda=1.0, n_jobs=-1,
+                               random_state=RANDOM_STATE, verbose=-1)
+else:
+    lgbm_cls = LGBMClassifier(n_estimators=150, max_depth=5, learning_rate=0.1,
+                               subsample=0.8, random_state=RANDOM_STATE)
+lgbm_cls.fit(X_tr_bal, y_tr_bal)
+lgbm_cp   = lgbm_cls.predict(X_test_reg)
+_proba3   = lgbm_cls.predict_proba(X_test_reg)
+lgbm_cpr  = _proba3[:,1] if _proba3.shape[1] > 1 else _proba3[:,0]
+print(classification_report(y_cls_test, lgbm_cp, target_names=["Normal","Low-Performance"]))
+lgbm_auc = roc_auc_score(y_cls_test, lgbm_cpr)
+print(f"  ROC-AUC: {lgbm_auc:.4f}")
+
+if   xgb_auc  >= rf_auc and xgb_auc  >= lgbm_auc:
+    best_cls_name  = XGB_LABEL;       best_cls_model = xgb_cls
+    best_cls_pred  = xgb_cp;          best_cls_proba = xgb_cpr;  best_cls_auc = xgb_auc
+elif lgbm_auc >= rf_auc:
+    best_cls_name  = LGBM_LABEL;      best_cls_model = lgbm_cls
+    best_cls_pred  = lgbm_cp;         best_cls_proba = lgbm_cpr; best_cls_auc = lgbm_auc
+else:
+    best_cls_name  = 'Random Forest'; best_cls_model = rf_cls
+    best_cls_pred  = rf_cp;           best_cls_proba = rf_cpr;   best_cls_auc = rf_auc
+
+print(f"\n  Best Stage 3 Classifier: {best_cls_name}  (AUC = {best_cls_auc:.4f})")
+joblib.dump(best_cls_model,
+            f"outputs/models/stage3_{best_cls_name.replace(' ','_')}.pkl")
+
+
+# ============================================================================
+# HYPERPARAMETER TUNING
+# ============================================================================
+
+section("HYPERPARAMETER TUNING — HURDLE STAGE 1, STAGE 2 & STAGE 3")
+
+N_ITER_RANDOM   = 30
+CV_FOLDS        = 3
+HP_RANDOM_STATE = RANDOM_STATE
+
+
+def report_search(search, stage_label):
+    results = pd.DataFrame(search.cv_results_)
+    cols    = [c for c in results.columns if 'param_' in c or c in
+               ('mean_test_score','std_test_score','rank_test_score')]
+    print(f"\n  Top-5 parameter sets for {stage_label}:")
+    print(results.sort_values('rank_test_score').head(5)[cols].to_string(index=False))
+    print(f"\n  Best score: {search.best_score_:.4f}")
+    print(f"  Best params: {search.best_params_}")
+
+
+subsection("Hurdle Stage 1 Tuning — Random Forest Classifier (RandomizedSearchCV)")
+h1_rf_param_dist = {
+    'n_estimators'     : [100,200,300,500],
+    'max_depth'        : [5,10,15,20,None],
+    'min_samples_split': [2,5,10],
+    'min_samples_leaf' : [1,2,4],
+    'max_features'     : ['sqrt','log2',0.5],
+    'class_weight'     : ['balanced','balanced_subsample',None],
+    'bootstrap'        : [True,False],
+}
+h1_rf_random = RandomizedSearchCV(
+    RandomForestClassifier(n_jobs=-1, random_state=HP_RANDOM_STATE),
+    h1_rf_param_dist, n_iter=N_ITER_RANDOM, scoring='roc_auc',
+    cv=CV_FOLDS, verbose=1, random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+h1_rf_random.fit(X_tr_h, y_tr_h)
+report_search(h1_rf_random, 'Hurdle Stage 1 RF — RandomizedSearchCV')
+
+subsection("Hurdle Stage 1 Tuning — Random Forest Classifier (GridSearchCV — focused)")
+best_h1_rf_rnd = h1_rf_random.best_params_
+h1_rf_grid_params = {
+    'n_estimators': sorted(set([max(50,best_h1_rf_rnd['n_estimators']-100),
+                                 best_h1_rf_rnd['n_estimators'],
+                                 best_h1_rf_rnd['n_estimators']+100])),
+    'max_depth'        : [best_h1_rf_rnd['max_depth']],
+    'min_samples_split': sorted(set([max(2,best_h1_rf_rnd['min_samples_split']-2),
+                                      best_h1_rf_rnd['min_samples_split'],
+                                      min(20,best_h1_rf_rnd['min_samples_split']+2)])),
+    'min_samples_leaf' : [best_h1_rf_rnd['min_samples_leaf']],
+    'max_features'     : [best_h1_rf_rnd['max_features']],
+    'class_weight'     : [best_h1_rf_rnd['class_weight']],
+    'bootstrap'        : [best_h1_rf_rnd['bootstrap']],
+}
+h1_rf_grid = GridSearchCV(
+    RandomForestClassifier(n_jobs=-1, random_state=HP_RANDOM_STATE),
+    h1_rf_grid_params, scoring='roc_auc', cv=CV_FOLDS, verbose=1, n_jobs=-1, refit=True)
+h1_rf_grid.fit(X_tr_h, y_tr_h)
+report_search(h1_rf_grid, 'Hurdle Stage 1 RF — GridSearchCV')
+best_h1_rf = h1_rf_grid.best_estimator_
+joblib.dump(best_h1_rf, 'outputs/models/hurdle_stage1_RF_tuned.pkl')
+
+subsection("Hurdle Stage 2 Tuning — Random Forest Regressor (RandomizedSearchCV)")
+h2_rf_param_dist = {
+    'n_estimators'     : [100,200,300,500],
+    'max_depth'        : [10,15,20,30,None],
+    'min_samples_split': [2,5,10],
+    'min_samples_leaf' : [1,2,4],
+    'max_features'     : ['sqrt','log2',0.5,0.8],
+    'bootstrap'        : [True,False],
+}
+h2_rf_random = RandomizedSearchCV(
+    RandomForestRegressor(n_jobs=-1, random_state=HP_RANDOM_STATE),
+    h2_rf_param_dist, n_iter=N_ITER_RANDOM, scoring='r2',
+    cv=CV_FOLDS, verbose=1, random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+h2_rf_random.fit(X_train_reg, y_train_reg)
+report_search(h2_rf_random, 'Hurdle Stage 2 RF — RandomizedSearchCV')
+
+subsection("Hurdle Stage 2 Tuning — Random Forest Regressor (GridSearchCV — focused)")
+best_h2_rf_rnd = h2_rf_random.best_params_
+h2_rf_grid_params = {
+    'n_estimators': sorted(set([max(50,best_h2_rf_rnd['n_estimators']-100),
+                                 best_h2_rf_rnd['n_estimators'],
+                                 best_h2_rf_rnd['n_estimators']+100])),
+    'max_depth'        : [best_h2_rf_rnd['max_depth']],
+    'min_samples_split': sorted(set([max(2,best_h2_rf_rnd['min_samples_split']-2),
+                                      best_h2_rf_rnd['min_samples_split'],
+                                      min(20,best_h2_rf_rnd['min_samples_split']+2)])),
+    'min_samples_leaf' : [best_h2_rf_rnd['min_samples_leaf']],
+    'max_features'     : [best_h2_rf_rnd['max_features']],
+    'bootstrap'        : [best_h2_rf_rnd['bootstrap']],
+}
+h2_rf_grid = GridSearchCV(
+    RandomForestRegressor(n_jobs=-1, random_state=HP_RANDOM_STATE),
+    h2_rf_grid_params, scoring='r2', cv=CV_FOLDS, verbose=1, n_jobs=-1, refit=True)
+h2_rf_grid.fit(X_train_reg, y_train_reg)
+report_search(h2_rf_grid, 'Hurdle Stage 2 RF — GridSearchCV')
+best_h2_rf = h2_rf_grid.best_estimator_
+joblib.dump(best_h2_rf, 'outputs/models/hurdle_stage2_RF_tuned.pkl')
+
+subsection(f"Hurdle Stage 2 Tuning — {XGB_LABEL} Regressor (RandomizedSearchCV)")
+if USE_XGB:
+    h2_xgb_param_dist = {
+        'n_estimators'    : [100,200,300,500],
+        'max_depth'       : [3,5,6,8,10],
+        'learning_rate'   : [0.01,0.03,0.05,0.1,0.2],
+        'subsample'       : [0.6,0.7,0.8,0.9,1.0],
+        'colsample_bytree': [0.5,0.6,0.7,0.8,1.0],
+        'reg_alpha'       : [0,0.01,0.1,0.5,1.0],
+        'reg_lambda'      : [0.5,1.0,2.0,5.0],
+        'min_child_weight': [1,3,5,7],
+        'gamma'           : [0,0.1,0.3,0.5],
+    }
+    h2_xgb_random = RandomizedSearchCV(
+        XGBRegressor(n_jobs=-1, random_state=HP_RANDOM_STATE, verbosity=0),
+        h2_xgb_param_dist, n_iter=N_ITER_RANDOM, scoring='r2',
+        cv=CV_FOLDS, verbose=1, random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+    h2_xgb_random.fit(X_train_reg, y_train_reg)
+    report_search(h2_xgb_random, f'Hurdle Stage 2 {XGB_LABEL} — RandomizedSearchCV')
+
+    best_h2_xgb_rnd = h2_xgb_random.best_params_
+    h2_xgb_grid_params = {
+        'n_estimators'    : sorted(set([max(50,best_h2_xgb_rnd['n_estimators']-100),
+                                         best_h2_xgb_rnd['n_estimators'],
+                                         best_h2_xgb_rnd['n_estimators']+100])),
+        'max_depth'       : [best_h2_xgb_rnd['max_depth']],
+        'learning_rate'   : [best_h2_xgb_rnd['learning_rate']],
+        'subsample'       : [best_h2_xgb_rnd['subsample']],
+        'colsample_bytree': [best_h2_xgb_rnd['colsample_bytree']],
+        'reg_alpha'       : [best_h2_xgb_rnd['reg_alpha']],
+        'reg_lambda'      : [best_h2_xgb_rnd['reg_lambda']],
+        'min_child_weight': [best_h2_xgb_rnd['min_child_weight']],
+        'gamma'           : [best_h2_xgb_rnd['gamma']],
+    }
+    h2_xgb_grid = GridSearchCV(
+        XGBRegressor(n_jobs=-1, random_state=HP_RANDOM_STATE, verbosity=0),
+        h2_xgb_grid_params, scoring='r2', cv=CV_FOLDS, verbose=1, n_jobs=-1, refit=True)
+    h2_xgb_grid.fit(X_train_reg, y_train_reg)
+    report_search(h2_xgb_grid, f'Hurdle Stage 2 {XGB_LABEL} — GridSearchCV')
+    best_h2_xgb = h2_xgb_grid.best_estimator_
+else:
+    h2_xgb_random = RandomizedSearchCV(
+        XGBRegressor(random_state=HP_RANDOM_STATE),
+        {'n_estimators':[100,200],'max_depth':[3,5,6],'learning_rate':[0.05,0.1]},
+        n_iter=10, scoring='r2', cv=CV_FOLDS, verbose=1,
+        random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+    h2_xgb_random.fit(X_train_reg, y_train_reg)
+    best_h2_xgb = h2_xgb_random.best_estimator_
+joblib.dump(best_h2_xgb,
+            f'outputs/models/hurdle_stage2_{XGB_LABEL.replace(" ","_")}_tuned.pkl')
+
+subsection(f"Hurdle Stage 2 Tuning — {LGBM_LABEL} Regressor (RandomizedSearchCV)")
+if USE_LGBM:
+    h2_lgbm_param_dist = {
+        'n_estimators'     : [100,200,300,400,500],
+        'num_leaves'       : [31,63,127,255],
+        'max_depth'        : [4,6,8,10,-1],
+        'learning_rate'    : [0.01,0.03,0.05,0.1,0.15,0.2],
+        'min_child_samples': [10,20,30,50],
+        'subsample'        : [0.6,0.7,0.8,0.9,1.0],
+        'colsample_bytree' : [0.5,0.6,0.7,0.8,1.0],
+        'reg_alpha'        : [0.0,0.01,0.1,0.5,1.0],
+        'reg_lambda'       : [0.5,1.0,2.0,5.0],
+    }
+    h2_lgbm_random = RandomizedSearchCV(
+        LGBMRegressor(n_jobs=-1, random_state=HP_RANDOM_STATE, verbose=-1),
+        h2_lgbm_param_dist, n_iter=N_ITER_RANDOM, scoring='r2',
+        cv=CV_FOLDS, verbose=1, random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+    h2_lgbm_random.fit(X_train_reg, y_train_reg)
+    report_search(h2_lgbm_random, f'Hurdle Stage 2 {LGBM_LABEL} — RandomizedSearchCV')
+
+    best_h2_lgbm_rnd = h2_lgbm_random.best_params_
+    h2_lgbm_grid_params = {
+        'n_estimators'    : sorted(set([max(50,best_h2_lgbm_rnd['n_estimators']-100),
+                                         best_h2_lgbm_rnd['n_estimators'],
+                                         best_h2_lgbm_rnd['n_estimators']+100])),
+        'num_leaves'       : [best_h2_lgbm_rnd['num_leaves']],
+        'max_depth'        : [best_h2_lgbm_rnd['max_depth']],
+        'learning_rate'    : [best_h2_lgbm_rnd['learning_rate']],
+        'min_child_samples': [best_h2_lgbm_rnd['min_child_samples']],
+        'subsample'        : [best_h2_lgbm_rnd['subsample']],
+        'colsample_bytree' : [best_h2_lgbm_rnd['colsample_bytree']],
+        'reg_alpha'        : [best_h2_lgbm_rnd['reg_alpha']],
+        'reg_lambda'       : [best_h2_lgbm_rnd['reg_lambda']],
+    }
+    h2_lgbm_grid = GridSearchCV(
+        LGBMRegressor(n_jobs=-1, random_state=HP_RANDOM_STATE, verbose=-1),
+        h2_lgbm_grid_params, scoring='r2', cv=CV_FOLDS, verbose=1, n_jobs=-1, refit=True)
+    h2_lgbm_grid.fit(X_train_reg, y_train_reg)
+    report_search(h2_lgbm_grid, f'Hurdle Stage 2 {LGBM_LABEL} — GridSearchCV')
+    best_h2_lgbm = h2_lgbm_grid.best_estimator_
+else:
+    h2_lgbm_random = RandomizedSearchCV(
+        LGBMRegressor(random_state=HP_RANDOM_STATE),
+        {'n_estimators':[100,200],'max_depth':[4,6],'learning_rate':[0.05,0.1]},
+        n_iter=10, scoring='r2', cv=CV_FOLDS, verbose=1,
+        random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+    h2_lgbm_random.fit(X_train_reg, y_train_reg)
+    best_h2_lgbm = h2_lgbm_random.best_estimator_
+joblib.dump(best_h2_lgbm,
+            f'outputs/models/hurdle_stage2_{LGBM_LABEL.replace(" ","_")}_tuned.pkl')
+
+subsection("Stage 3 Tuning — Random Forest Classifier (RandomizedSearchCV)")
+rf_cls_param_dist = {
+    'n_estimators'     : [100,200,300,500],
+    'max_depth'        : [5,10,15,20,None],
+    'min_samples_split': [2,5,10],
+    'min_samples_leaf' : [1,2,4],
+    'max_features'     : ['sqrt','log2',0.5],
+    'class_weight'     : ['balanced','balanced_subsample',None],
+    'bootstrap'        : [True,False],
+}
+rf_cls_random = RandomizedSearchCV(
+    RandomForestClassifier(n_jobs=-1, random_state=HP_RANDOM_STATE),
+    rf_cls_param_dist, n_iter=N_ITER_RANDOM, scoring='roc_auc',
+    cv=CV_FOLDS, verbose=1, random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+rf_cls_random.fit(X_tr_bal, y_tr_bal)
+report_search(rf_cls_random, 'Stage 3 RF Classifier — RandomizedSearchCV')
+
+subsection("Stage 3 Tuning — Random Forest Classifier (GridSearchCV — focused)")
+best_rf_cls_rnd    = rf_cls_random.best_params_
+rf_cls_grid_params = {
+    'n_estimators': sorted(set([max(50,best_rf_cls_rnd['n_estimators']-100),
+                                 best_rf_cls_rnd['n_estimators'],
+                                 best_rf_cls_rnd['n_estimators']+100])),
+    'max_depth'        : [best_rf_cls_rnd['max_depth']],
+    'min_samples_split': sorted(set([max(2,best_rf_cls_rnd['min_samples_split']-2),
+                                      best_rf_cls_rnd['min_samples_split'],
+                                      min(20,best_rf_cls_rnd['min_samples_split']+2)])),
+    'min_samples_leaf' : [best_rf_cls_rnd['min_samples_leaf']],
+    'max_features'     : [best_rf_cls_rnd['max_features']],
+    'class_weight'     : [best_rf_cls_rnd['class_weight']],
+    'bootstrap'        : [best_rf_cls_rnd['bootstrap']],
+}
+rf_cls_grid = GridSearchCV(
+    RandomForestClassifier(n_jobs=-1, random_state=HP_RANDOM_STATE),
+    rf_cls_grid_params, scoring='roc_auc', cv=CV_FOLDS, verbose=1, n_jobs=-1, refit=True)
+rf_cls_grid.fit(X_tr_bal, y_tr_bal)
+report_search(rf_cls_grid, 'Stage 3 RF Classifier — GridSearchCV')
+best_rf_cls        = rf_cls_grid.best_estimator_
+best_rf_cls_params = rf_cls_grid.best_params_
+joblib.dump(best_rf_cls, 'outputs/models/stage3_RF_tuned.pkl')
+
+subsection(f"Stage 3 Tuning — {XGB_LABEL} Classifier")
+if USE_XGB:
+    xgb_cls_param_dist = {
+        'n_estimators'    : [100,200,300,500],
+        'max_depth'       : [3,5,6,8],
+        'learning_rate'   : [0.01,0.03,0.05,0.1,0.2],
+        'subsample'       : [0.6,0.7,0.8,0.9,1.0],
+        'colsample_bytree': [0.5,0.6,0.8,1.0],
+        'scale_pos_weight': [1,pos_w,pos_w*0.5,pos_w*1.5],
+        'reg_alpha'       : [0,0.01,0.1,0.5],
+        'reg_lambda'      : [0.5,1.0,2.0],
+        'min_child_weight': [1,3,5],
+        'gamma'           : [0,0.1,0.3],
+    }
+    xgb_cls_random = RandomizedSearchCV(
+        XGBClassifier(n_jobs=-1, random_state=HP_RANDOM_STATE,
+                      use_label_encoder=False, eval_metric='logloss', verbosity=0),
+        xgb_cls_param_dist, n_iter=N_ITER_RANDOM, scoring='roc_auc',
+        cv=CV_FOLDS, verbose=1, random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+    xgb_cls_random.fit(X_tr_bal, y_tr_bal)
+    best_xgb_cls_rnd = xgb_cls_random.best_params_
+    xgb_cls_grid_params = {k: [v] for k, v in best_xgb_cls_rnd.items()}
+    xgb_cls_grid = GridSearchCV(
+        XGBClassifier(n_jobs=-1, random_state=HP_RANDOM_STATE,
+                      use_label_encoder=False, eval_metric='logloss', verbosity=0),
+        xgb_cls_grid_params, scoring='roc_auc', cv=CV_FOLDS, verbose=1, n_jobs=-1, refit=True)
+    xgb_cls_grid.fit(X_tr_bal, y_tr_bal)
+    best_xgb_cls        = xgb_cls_grid.best_estimator_
+    best_xgb_cls_params = xgb_cls_grid.best_params_
+else:
+    xgb_cls_random = RandomizedSearchCV(
+        XGBClassifier(random_state=HP_RANDOM_STATE),
+        {'n_estimators':[100,200],'max_depth':[3,5],'learning_rate':[0.05,0.1]},
+        n_iter=10, scoring='roc_auc', cv=CV_FOLDS, verbose=1,
+        random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+    xgb_cls_random.fit(X_tr_bal, y_tr_bal)
+    best_xgb_cls        = xgb_cls_random.best_estimator_
+    best_xgb_cls_params = xgb_cls_random.best_params_
+joblib.dump(best_xgb_cls, f'outputs/models/stage3_{XGB_LABEL.replace(" ","_")}_tuned.pkl')
+
+subsection(f"Stage 3 Tuning — {LGBM_LABEL} Classifier")
+if USE_LGBM:
+    lgbm_cls_param_dist = {
+        'n_estimators'     : [100,200,300,400,500],
+        'num_leaves'       : [31,63,127],
+        'max_depth'        : [4,6,8,-1],
+        'learning_rate'    : [0.01,0.03,0.05,0.1,0.2],
+        'min_child_samples': [10,20,30,50],
+        'subsample'        : [0.6,0.7,0.8,0.9],
+        'colsample_bytree' : [0.5,0.6,0.8,1.0],
+        'scale_pos_weight' : [1,pos_w,pos_w*0.5,pos_w*1.5],
+        'reg_alpha'        : [0.0,0.01,0.1,0.5],
+        'reg_lambda'       : [0.5,1.0,2.0],
+    }
+    lgbm_cls_random = RandomizedSearchCV(
+        LGBMClassifier(n_jobs=-1, random_state=HP_RANDOM_STATE,
+                       verbose=-1, class_weight='balanced'),
+        lgbm_cls_param_dist, n_iter=N_ITER_RANDOM, scoring='roc_auc',
+        cv=CV_FOLDS, verbose=1, random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+    lgbm_cls_random.fit(X_tr_bal, y_tr_bal)
+    best_lgbm_cls_rnd = lgbm_cls_random.best_params_
+    lgbm_cls_grid_params = {k: [v] for k, v in best_lgbm_cls_rnd.items()}
+    lgbm_cls_grid = GridSearchCV(
+        LGBMClassifier(n_jobs=-1, random_state=HP_RANDOM_STATE,
+                       verbose=-1, class_weight='balanced'),
+        lgbm_cls_grid_params, scoring='roc_auc', cv=CV_FOLDS, verbose=1, n_jobs=-1, refit=True)
+    lgbm_cls_grid.fit(X_tr_bal, y_tr_bal)
+    best_lgbm_cls        = lgbm_cls_grid.best_estimator_
+    best_lgbm_cls_params = lgbm_cls_grid.best_params_
+else:
+    lgbm_cls_random = RandomizedSearchCV(
+        LGBMClassifier(random_state=HP_RANDOM_STATE),
+        {'n_estimators':[100,150],'max_depth':[4,6],'learning_rate':[0.05,0.1]},
+        n_iter=10, scoring='roc_auc', cv=CV_FOLDS, verbose=1,
+        random_state=HP_RANDOM_STATE, n_jobs=-1, refit=True)
+    lgbm_cls_random.fit(X_tr_bal, y_tr_bal)
+    best_lgbm_cls        = lgbm_cls_random.best_estimator_
+    best_lgbm_cls_params = lgbm_cls_random.best_params_
+joblib.dump(best_lgbm_cls, f'outputs/models/stage3_{LGBM_LABEL.replace(" ","_")}_tuned.pkl')
+
+subsection("Stage 3 — Tuned Model Evaluation")
+rf_cp_tuned    = best_rf_cls.predict(X_test_reg)
+_p_rf          = best_rf_cls.predict_proba(X_test_reg)
+rf_cpr_tuned   = _p_rf[:,1]
+rf_auc_tuned   = roc_auc_score(y_cls_test, rf_cpr_tuned)
+
+xgb_cp_tuned   = best_xgb_cls.predict(X_test_reg)
+_p_xgb         = best_xgb_cls.predict_proba(X_test_reg)
+xgb_cpr_tuned  = _p_xgb[:,1]
+xgb_auc_tuned  = roc_auc_score(y_cls_test, xgb_cpr_tuned)
+
+lgbm_cp_tuned  = best_lgbm_cls.predict(X_test_reg)
+_p_lgbm        = best_lgbm_cls.predict_proba(X_test_reg)
+lgbm_cpr_tuned = _p_lgbm[:,1]
+lgbm_auc_tuned = roc_auc_score(y_cls_test, lgbm_cpr_tuned)
+
+rf_cp    = rf_cp_tuned;    rf_cpr   = rf_cpr_tuned;   rf_auc   = rf_auc_tuned
+xgb_cp   = xgb_cp_tuned;  xgb_cpr  = xgb_cpr_tuned;  xgb_auc  = xgb_auc_tuned
+lgbm_cp  = lgbm_cp_tuned; lgbm_cpr = lgbm_cpr_tuned; lgbm_auc = lgbm_auc_tuned
+
+if   xgb_auc  >= rf_auc and xgb_auc  >= lgbm_auc:
+    best_cls_name  = XGB_LABEL;       best_cls_model = best_xgb_cls
+    best_cls_pred  = xgb_cp;          best_cls_proba = xgb_cpr; best_cls_auc = xgb_auc
+elif lgbm_auc >= rf_auc:
+    best_cls_name  = LGBM_LABEL;      best_cls_model = best_lgbm_cls
+    best_cls_pred  = lgbm_cp;         best_cls_proba = lgbm_cpr; best_cls_auc = lgbm_auc
+else:
+    best_cls_name  = 'Random Forest'; best_cls_model = best_rf_cls
+    best_cls_pred  = rf_cp;           best_cls_proba = rf_cpr; best_cls_auc = rf_auc
+
+joblib.dump(best_cls_model,
+            f"outputs/models/stage3_BEST_{best_cls_name.replace(' ','_')}_tuned.pkl")
+
+subsection("Final Tuned Hurdle Evaluation — Full population R2")
+
+h2_rf_tuned_pred   = np.clip(best_h2_rf.predict(X_test_reg), 0, None)
+h2_xgb_tuned_pred  = np.clip(best_h2_xgb.predict(X_test_reg), 0, None)
+h2_lgbm_tuned_pred = np.clip(best_h2_lgbm.predict(X_test_reg), 0, None)
+
+h2_rf_m_tuned   = {'TestR2': r2_score(y_test_reg, h2_rf_tuned_pred),
+                   'RMSE'  : np.sqrt(mean_squared_error(y_test_reg, h2_rf_tuned_pred)),
+                   'MAE'   : mean_absolute_error(y_test_reg, h2_rf_tuned_pred)}
+h2_xgb_m_tuned  = {'TestR2': r2_score(y_test_reg, h2_xgb_tuned_pred),
+                   'RMSE'  : np.sqrt(mean_squared_error(y_test_reg, h2_xgb_tuned_pred)),
+                   'MAE'   : mean_absolute_error(y_test_reg, h2_xgb_tuned_pred)}
+h2_lgbm_m_tuned = {'TestR2': r2_score(y_test_reg, h2_lgbm_tuned_pred),
+                   'RMSE'  : np.sqrt(mean_squared_error(y_test_reg, h2_lgbm_tuned_pred)),
+                   'MAE'   : mean_absolute_error(y_test_reg, h2_lgbm_tuned_pred)}
+
+if   h2_xgb_m_tuned['TestR2']  >= h2_rf_m_tuned['TestR2'] and \
+     h2_xgb_m_tuned['TestR2']  >= h2_lgbm_m_tuned['TestR2']:
+    best_h2_name  = XGB_LABEL;       best_h2_model  = best_h2_xgb
+    best_h2_pred  = h2_xgb_tuned_pred; best_h2_m = h2_xgb_m_tuned
+elif h2_lgbm_m_tuned['TestR2'] >= h2_rf_m_tuned['TestR2']:
+    best_h2_name  = LGBM_LABEL;      best_h2_model  = best_h2_lgbm
+    best_h2_pred  = h2_lgbm_tuned_pred; best_h2_m = h2_lgbm_m_tuned
+else:
+    best_h2_name  = 'Random Forest'; best_h2_model  = best_h2_rf
+    best_h2_pred  = h2_rf_tuned_pred; best_h2_m = h2_rf_m_tuned
+
+joblib.dump(best_h2_model,
+            f"outputs/models/hurdle_stage2_BEST_{best_h2_name.replace(' ','_')}_tuned.pkl")
+
+hurdle_tuned_results = {}
+for tag, h1_m, h2_m in [
+    ('Random Forest', best_h1_rf,  best_h2_rf),
+    (XGB_LABEL,       best_h1_rf,  best_h2_xgb),
+    (LGBM_LABEL,      best_h1_rf,  best_h2_lgbm),
+]:
+    x_arr = X_test_full.values if hasattr(X_test_full, 'values') else X_test_full
+    y_arr = y_test_full.values if hasattr(y_test_full, 'values') else y_test_full
+    res = hurdle_predict_full(x_arr, y_arr, best_h1_rf, h2_m,
+                              {}, threshold=HURDLE_THRESHOLD,
+                              label=f'Tuned  {tag}')
+    hurdle_tuned_results[tag] = res
+
+best_hurdle_tuned_tag = max(hurdle_tuned_results,
+                            key=lambda k: hurdle_tuned_results[k]['r2'])
+best_hurdle_tuned     = hurdle_tuned_results[best_hurdle_tuned_tag]
+joblib.dump(best_h1_rf,
+            f"outputs/models/hurdle_stage1_BEST_{best_h1_name.replace(' ','_')}_tuned.pkl")
+
+
+# ============================================================================
+# CROSS-VALIDATION
+# ============================================================================
+section("5-FOLD CROSS-VALIDATION — ALL MODELS")
+
+cv_h2_rf   = cross_val_score(best_h2_rf,   X_active, y_active, cv=5, scoring='r2', n_jobs=-1)
+cv_h2_xgb  = cross_val_score(best_h2_xgb,  X_active, y_active, cv=5, scoring='r2', n_jobs=-1)
+cv_h2_lgbm = cross_val_score(best_h2_lgbm, X_active, y_active, cv=5, scoring='r2', n_jobs=-1)
+cv_c_rf    = cross_val_score(best_rf_cls,   X_active, y_active < threshold_anom,
+                             cv=5, scoring='roc_auc', n_jobs=-1)
+cv_c_xgb   = cross_val_score(best_xgb_cls,  X_active, y_active < threshold_anom,
+                             cv=5, scoring='roc_auc', n_jobs=-1)
+cv_c_lgbm  = cross_val_score(best_lgbm_cls, X_active, y_active < threshold_anom,
+                             cv=5, scoring='roc_auc', n_jobs=-1)
+
+print(f"  Stage 2 Regressor R2  : "
+      f"RF {cv_h2_rf.mean():.4f}+/-{cv_h2_rf.std():.4f}  |  "
+      f"{XGB_LABEL} {cv_h2_xgb.mean():.4f}+/-{cv_h2_xgb.std():.4f}  |  "
+      f"{LGBM_LABEL} {cv_h2_lgbm.mean():.4f}+/-{cv_h2_lgbm.std():.4f}")
+print(f"  Stage 3 Anomaly AUC   : "
+      f"RF {cv_c_rf.mean():.4f}+/-{cv_c_rf.std():.4f}  |  "
+      f"{XGB_LABEL} {cv_c_xgb.mean():.4f}+/-{cv_c_xgb.std():.4f}  |  "
+      f"{LGBM_LABEL} {cv_c_lgbm.mean():.4f}+/-{cv_c_lgbm.std():.4f}")
+
+
+# ============================================================================
+# VISUALISATIONS
+# ============================================================================
+section("GENERATING VISUALISATIONS (300 dpi)")
+
+line_styles = ['-', '--', '-.']
+
+h2_preds_dict = {
+    'Random Forest': h2_rf_tuned_pred,
+    XGB_LABEL      : h2_xgb_tuned_pred,
+    LGBM_LABEL     : h2_lgbm_tuned_pred,
+}
+h2_m_dict = {
+    'Random Forest': h2_rf_m_tuned,
+    XGB_LABEL      : h2_xgb_m_tuned,
+    LGBM_LABEL     : h2_lgbm_m_tuned,
+}
+
+model_preds_reg = [
+    ('Random_Forest',                   'Random Forest', h2_rf_tuned_pred,   '#3498db'),
+    (XGB_LABEL.replace(' ','_'),        XGB_LABEL,       h2_xgb_tuned_pred,  '#e74c3c'),
+    (LGBM_LABEL.replace(' ','_'),       LGBM_LABEL,      h2_lgbm_tuned_pred, '#27ae60'),
+]
+model_preds_cls = [
+    ('Random_Forest',             'Random Forest', rf_cp,   rf_cpr),
+    (XGB_LABEL.replace(' ','_'), XGB_LABEL,        xgb_cp,  xgb_cpr),
+    (LGBM_LABEL.replace(' ','_'),LGBM_LABEL,       lgbm_cp, lgbm_cpr),
+]
+
+# Fig 0: Architecture Diagram
+fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+ax.axis('off')
+diagram = """
+  ALL UE Observations (scheduled + unscheduled)
+                      |
+                      v
+     HURDLE STAGE 1 — Scheduling Gate
+     Binary Classifier (is_scheduled?)
+     RF / XGBoost / LightGBM
+                      |
+         +------------+------------+
+         |                         |
+    p < threshold             p >= threshold
+         |                         |
+  Predicted THP = 0        HURDLE STAGE 2 — Regressor
+  (unscheduled / idle)     Predicted THP = y Mbps
+                           RF / XGBoost / LightGBM
+                                   |
+                                   v
+                           STAGE 3 — Anomaly Flag
+                           (active UEs only)
+                           is_low_performance?
+"""
+ax.text(0.5, 0.5, diagram, transform=ax.transAxes, ha='center', va='center',
+        fontsize=12, fontfamily='monospace',
+        bbox=dict(boxstyle='round', facecolor='#f0f4f8', edgecolor='#2c3e50', linewidth=2))
+ax.set_title('Hurdle Model Architecture — 5G Throughput Prediction',
+             fontsize=15, fontweight='bold', pad=20)
+plt.tight_layout()
+show_and_save('outputs/plots/fig0_hurdle_architecture.png')
+
+# Fig 1: Hurdle Stage 1 ROC Curve
+fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+for (name, model, proba), ls in zip(
+    [('Random Forest', h1_rf,  h1_rf_proba),
+     (XGB_LABEL,       h1_xgb, h1_xgb_proba),
+     (LGBM_LABEL,      h1_lgbm, h1_lgbm_proba)], line_styles):
+    fp, tp, _ = roc_curve(y_test_hurdle, proba)
+    auc_val   = roc_auc_score(y_test_hurdle, proba)
+    ax.plot(fp, tp, lw=2.8, ls=ls, label=f'{name}  AUC = {auc_val:.4f}')
+ax.plot([0,1],[0,1],'k--',lw=1.5,alpha=0.5,label='Random classifier')
+ax.set_title('Hurdle Stage 1 — ROC Curves: Scheduling Gate\n'
+             'Classifying Scheduled (THP>0) vs Unscheduled (THP=0) UEs',
+             fontweight='bold', pad=14)
+ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
+ax.legend(loc='lower right'); ax.grid(alpha=0.25)
+plt.tight_layout()
+show_and_save('outputs/plots/fig1_hurdle_stage1_roc.png')
+
+# Fig 2: Actual vs Predicted — Stage 2
+for fname, name, pred, col in model_preds_reg:
+    fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+    ax.scatter(y_test_reg, pred, alpha=0.30, s=14, c=col, rasterized=True,
+               label='Active UE samples')
+    lo = min(float(y_test_reg.min()), float(pred.min()))
+    hi = max(float(y_test_reg.max()), float(pred.max()))
+    ax.plot([lo, hi], [lo, hi], 'r--', lw=2.5, label='Ideal  y = x')
+    m = h2_m_dict.get(name, h2_preds_dict)
+    if isinstance(m, dict) and 'TestR2' in m:
+        r2_val   = m['TestR2']
+        rmse_val = m['RMSE']
+    else:
+        r2_val   = r2_score(y_test_reg, pred)
+        rmse_val = np.sqrt(mean_squared_error(y_test_reg, pred))
+    ax.set_title(f'Hurdle Stage 2 — Actual vs Predicted DL Throughput (Active UEs)\n'
+                 f'{name}   R2 = {r2_val:.4f}   RMSE = {rmse_val:.4f} Mbps',
+                 fontweight='bold', pad=14)
+    ax.set_xlabel('Actual DL Throughput (Mbps)')
+    ax.set_ylabel('Predicted DL Throughput (Mbps)')
+    ax.legend(); ax.grid(alpha=0.25)
+    plt.tight_layout()
+    show_and_save(f'outputs/plots/fig2_actual_vs_predicted_{fname}.png')
+
+# Fig 3: Combined hurdle prediction — full population
+fig, axes = plt.subplots(1, 2, figsize=(20, SLIDE_H))
+fig.suptitle('Combined Hurdle Prediction — Full Population (Active + Unscheduled UEs)\n'
+             'Predicted THP = Stage1(x) >= threshold -> Stage2(x)  else  0',
+             fontsize=14, fontweight='bold')
+
+best_full_pred = best_hurdle_tuned['y_hat']
+y_test_arr     = y_test_full.values if hasattr(y_test_full, 'values') else y_test_full
+
+ax = axes[0]
+ax.scatter(y_test_arr, best_full_pred, alpha=0.15, s=8,
+           c=np.where(y_test_arr == 0, '#e74c3c', '#3498db'),
+           rasterized=True)
+lo = min(float(y_test_arr.min()), float(best_full_pred.min()))
+hi = max(float(y_test_arr.max()), float(best_full_pred.max()))
+ax.plot([lo, hi], [lo, hi], 'r--', lw=2.5, label='Ideal  y = x')
+patches = [mpatches.Patch(color='#e74c3c', label='Unscheduled (THP=0)'),
+           mpatches.Patch(color='#3498db', label='Active (THP>0)')]
+ax.legend(handles=patches, loc='upper left')
+ax.set_title(f'Actual vs Predicted — Full Population\n'
+             f'Combined R2 = {best_hurdle_tuned["r2"]:.4f}   '
+             f'RMSE = {best_hurdle_tuned["rmse"]:.4f} Mbps',
+             fontweight='bold')
+ax.set_xlabel('Actual DL Throughput (Mbps)')
+ax.set_ylabel('Predicted DL Throughput (Mbps)')
+ax.grid(alpha=0.25)
+
+ax = axes[1]
+ax.hist(y_test_arr, bins=70, alpha=0.55, color='steelblue', label='Actual', edgecolor='none')
+ax.hist(best_full_pred, bins=70, alpha=0.55, color='tomato', label='Predicted', edgecolor='none')
+ax.axvline(0, color='black', lw=2, ls='--', label='Hurdle boundary (THP=0)')
+ax.set_title('Distribution Comparison — Actual vs Predicted', fontweight='bold')
+ax.set_xlabel('DL Throughput (Mbps)'); ax.set_ylabel('Count')
+ax.legend(); ax.grid(alpha=0.25)
+
+plt.tight_layout()
+show_and_save('outputs/plots/fig3_hurdle_combined_prediction.png')
+
+# Fig 4: Residuals — Stage 2
+for fname, name, pred, col in model_preds_reg:
+    fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+    resid = y_test_reg.values - pred if hasattr(y_test_reg, 'values') else y_test_reg - pred
+    ax.scatter(pred, resid, alpha=0.25, s=12, c=col, rasterized=True)
+    ax.axhline(0, color='navy', lw=2, ls='--', label='Zero residual')
+    ax.set_title(f'Hurdle Stage 2 — Residuals\n'
+                 f'{name}   Bias = {resid.mean():.4f}   Std = {resid.std():.4f}',
+                 fontweight='bold', pad=14)
+    ax.set_xlabel('Predicted DL Throughput (Mbps)')
+    ax.set_ylabel('Residual  (Actual - Predicted)')
+    ax.legend(); ax.grid(alpha=0.25)
+    plt.tight_layout()
+    show_and_save(f'outputs/plots/fig4_residuals_{fname}.png')
+
+# Fig 5: Stage 3 ROC Curves
+fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+for (fname, name, _, pr), ls in zip(model_preds_cls, line_styles):
+    fp, tp, _ = roc_curve(y_cls_test, pr)
+    ax.plot(fp, tp, lw=2.8, ls=ls,
+            label=f'{name}   AUC = {roc_auc_score(y_cls_test, pr):.4f}')
+ax.plot([0,1],[0,1],'k--',lw=1.5,alpha=0.5,label='Random classifier')
+ax.set_title('Stage 3 — ROC Curves: Low-Performance UE Detection',
+             fontweight='bold', pad=14)
+ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
+ax.legend(loc='lower right'); ax.grid(alpha=0.25)
+plt.tight_layout()
+show_and_save('outputs/plots/fig5_stage3_roc_curves.png')
+
+# Fig 6: Confusion Matrix — Stage 3
+_auc_lookup = {'Random_Forest'             : rf_auc,
+               XGB_LABEL.replace(' ','_')  : xgb_auc,
+               LGBM_LABEL.replace(' ','_') : lgbm_auc}
+for fname, name, pred, _ in model_preds_cls:
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ConfusionMatrixDisplay(
+        confusion_matrix(y_cls_test, pred),
+        display_labels=['Normal', 'Low-Performance']
+    ).plot(ax=ax, colorbar=True, cmap='Blues')
+    ax.set_title(f'Stage 3 — Confusion Matrix\n'
+                 f'{name}   AUC = {_auc_lookup[fname]:.4f}',
+                 fontweight='bold', pad=14)
+    ax.tick_params(labelsize=12)
+    plt.tight_layout()
+    show_and_save(f'outputs/plots/fig6_confusion_matrix_{fname}.png')
+
+# Fig 7: Feature Importances
+for stage_tag, stage_label, model, mname in [
+    ('hurdle_stage2', 'Hurdle Stage 2 — Throughput Regressor', best_h2_model, best_h2_name),
+    ('stage3_cls',    'Stage 3 — Anomaly Classifier',          best_cls_model, best_cls_name)
+]:
+    imp = (pd.Series(model.feature_importances_, index=FEATURES)
+             .sort_values().tail(15))
+    fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+    colors_imp = plt.cm.RdYlGn(np.linspace(0.25, 0.85, len(imp)))
+    imp.plot(kind='barh', ax=ax, color=colors_imp, edgecolor='white', width=0.7)
+    ax.set_title(f'Feature Importances — Top 15\n{stage_label}  [{mname}]',
+                 fontweight='bold', pad=14)
+    ax.set_xlabel('Mean Decrease in Impurity')
+    for bar, val in zip(ax.patches, imp.values):
+        ax.text(val + imp.max()*0.012, bar.get_y()+bar.get_height()/2,
+                f'{val:.4f}', va='center', fontsize=10)
+    ax.grid(axis='x', alpha=0.25)
+    plt.tight_layout()
+    show_and_save(f'outputs/plots/fig7_feature_importances_{stage_tag}.png')
+
+# Fig 8: Three-Model Comparison
+fig, axes = plt.subplots(1, 3, figsize=(20, SLIDE_H))
+fig.suptitle('Three-Model Comparison: Random Forest vs XGBoost vs LightGBM\n'
+             'All tuned with RandomizedSearchCV + GridSearchCV',
+             fontsize=15, fontweight='bold')
+models3  = ['Random Forest', XGB_LABEL, LGBM_LABEL]
+colors3  = ['#3498db', '#e74c3c', '#27ae60']
+x3       = np.arange(len(models3))
+bw3      = 0.55
+
+full_r2_vals = [hurdle_tuned_results.get(m, {}).get('r2', 0) for m in models3]
+stage2_r2    = [h2_rf_m_tuned['TestR2'], h2_xgb_m_tuned['TestR2'], h2_lgbm_m_tuned['TestR2']]
+auc_vals     = [rf_auc, xgb_auc, lgbm_auc]
+
+for ax, (vals, ylabel, title) in zip(axes, [
+    (full_r2_vals, 'Combined R2 (full pop.)', 'Hurdle — Full Population R2\n(zeros + active)'),
+    (stage2_r2,    'Stage 2 R2 (active)',      'Stage 2 Regressor R2\n(active UEs only)'),
+    (auc_vals,     'Stage 3 ROC-AUC',          'Stage 3 Anomaly AUC\n(low-performance detection)'),
+]):
+    bars = ax.bar(x3, vals, width=bw3, color=colors3, edgecolor='white', alpha=0.88)
+    ax.set_xticks(x3); ax.set_xticklabels(models3, rotation=10, fontsize=11)
+    ax.set_ylabel(ylabel); ax.set_ylim(0, 1.20)
+    ax.set_title(title, fontweight='bold')
+    for bar, val in zip(bars, vals):
+        ax.text(bar.get_x()+bar.get_width()/2, val+0.015,
+                f'{val:.4f}', ha='center', va='bottom', fontweight='bold', fontsize=10)
+    if vals:
+        ax.annotate('Best', xy=(x3[np.argmax(vals)], max(vals)+0.07),
+                    ha='center', color='goldenrod', fontsize=13, fontweight='bold')
+    ax.grid(axis='y', alpha=0.25)
+plt.tight_layout()
+show_and_save('outputs/plots/fig8_three_model_comparison.png')
+
+# Fig 9: Cross-Validation fold-by-fold
+for tag, metric_name, s_rf, s_xgb, s_lgbm, yl in [
+    ('r2',  'Stage 2 Regressor R2',    cv_h2_rf, cv_h2_xgb, cv_h2_lgbm, 'R2'),
+    ('auc', 'Stage 3 Anomaly AUC',     cv_c_rf,  cv_c_xgb,  cv_c_lgbm,  'ROC-AUC'),
+]:
+    fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+    folds = np.arange(1, 6)
+    ax.plot(folds, s_rf,   'o-', lw=2.5, ms=9, color='#3498db',
+            label=f'Random Forest  mean={s_rf.mean():.4f} +/- {s_rf.std():.4f}')
+    ax.plot(folds, s_xgb,  's-', lw=2.5, ms=9, color='#e74c3c',
+            label=f'{XGB_LABEL}  mean={s_xgb.mean():.4f} +/- {s_xgb.std():.4f}')
+    ax.plot(folds, s_lgbm, '^-', lw=2.5, ms=9, color='#27ae60',
+            label=f'{LGBM_LABEL}  mean={s_lgbm.mean():.4f} +/- {s_lgbm.std():.4f}')
+    ax.fill_between(folds, s_rf,   alpha=0.08, color='#3498db')
+    ax.fill_between(folds, s_xgb,  alpha=0.08, color='#e74c3c')
+    ax.fill_between(folds, s_lgbm, alpha=0.08, color='#27ae60')
+    ax.set_title(f'5-Fold Cross-Validation — {metric_name}', fontweight='bold', pad=14)
+    ax.set_xlabel('Fold Number'); ax.set_ylabel(yl)
+    ax.set_xticks(folds)
+    ax.legend(loc='lower right'); ax.grid(alpha=0.25)
+    plt.tight_layout()
+    show_and_save(f'outputs/plots/fig9_cross_validation_{tag}.png')
+
+# Fig 10: Precision-Recall — Stage 3
+fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+for (fname, name, _, pr), ls in zip(model_preds_cls, line_styles):
+    p_vals, r_vals, _ = precision_recall_curve(y_cls_test, pr)
+    ax.plot(r_vals, p_vals, lw=2.8, ls=ls, label=name)
+ax.axhline(y_cls_test.mean(), color='navy', ls=':', lw=2,
+           label=f'No-skill baseline  ({y_cls_test.mean():.3f})')
+ax.set_title('Stage 3 — Precision-Recall Curves: Low-Performance UE Detection',
+             fontweight='bold', pad=14)
+ax.set_xlabel('Recall'); ax.set_ylabel('Precision')
+ax.legend(); ax.grid(alpha=0.25)
+plt.tight_layout()
+show_and_save('outputs/plots/fig10_precision_recall.png')
+
+# Fig 11: Anomaly Distribution
+fig, ax = plt.subplots(figsize=(SLIDE_W, SLIDE_H))
+ax.hist(best_h2_pred[y_cls_test==0], bins=70, alpha=0.65,
+        color='steelblue', label='Normal UEs', edgecolor='none')
+ax.hist(best_h2_pred[y_cls_test==1], bins=70, alpha=0.65,
+        color='#e74c3c',   label='Low-Performance UEs', edgecolor='none')
+ax.axvline(threshold_anom, color='black', lw=2.5, ls='--',
+           label=f'Low-perf threshold  ({threshold_anom:.4f} Mbps)')
+ax.set_title('Stage 3 — Anomaly Distribution on Predicted DL Throughput',
+             fontweight='bold', pad=14)
+ax.set_xlabel('Predicted DL Throughput (Mbps)')
+ax.set_ylabel('Number of UEs')
+ax.legend(); ax.grid(alpha=0.25)
+plt.tight_layout()
+show_and_save('outputs/plots/fig11_anomaly_distribution.png')
+
+print("\n  All figures saved to outputs/plots/ at 300 dpi")
+
+
+# ============================================================================
+# RESULTS SUMMARY
+# ============================================================================
+section("RESULTS SUMMARY")
+
+print(f"""
+  HURDLE STAGE 1 — Scheduling Gate (Full Population)
+  ──────────────────────────────────────────────────────────────────
+  Random Forest    Gate AUC = {h1_rf_auc:.4f}
+  {XGB_LABEL:<14}  Gate AUC = {h1_xgb_auc:.4f}
+  {LGBM_LABEL:<14}  Gate AUC = {h1_lgbm_auc:.4f}
+  Winner: {best_h1_name}
+
+  HURDLE STAGE 2 — Throughput Regressor (Active UEs only)
+  ──────────────────────────────────────────────────────────────────
+  Random Forest    Test R2 = {h2_rf_m_tuned['TestR2']:.4f}  RMSE = {h2_rf_m_tuned['RMSE']:.4f} Mbps
+  {XGB_LABEL:<14}  Test R2 = {h2_xgb_m_tuned['TestR2']:.4f}  RMSE = {h2_xgb_m_tuned['RMSE']:.4f} Mbps
+  {LGBM_LABEL:<14}  Test R2 = {h2_lgbm_m_tuned['TestR2']:.4f}  RMSE = {h2_lgbm_m_tuned['RMSE']:.4f} Mbps
+  Winner: {best_h2_name}
+
+  COMBINED HURDLE — Full Population R2
+  ──────────────────────────────────────────────────────────────────""")
+for tag in ['Random Forest', XGB_LABEL, LGBM_LABEL]:
+    res = hurdle_tuned_results.get(tag, {})
+    print(f"  {tag:<20} Combined R2 = {res.get('r2', 0):.4f}  "
+          f"RMSE = {res.get('rmse', 0):.4f} Mbps  "
+          f"Gate AUC = {res.get('gate_auc', 0):.4f}")
+print(f"  Best Combo: {best_hurdle_tuned_tag}  "
+      f"(Combined R2 = {best_hurdle_tuned['r2']:.4f})")
+
+print(f"""
+  STAGE 3 — Anomaly Classifier (Active UEs, Low-Performance Flag)
+  ──────────────────────────────────────────────────────────────────
+  Random Forest    ROC-AUC = {rf_auc:.4f}  CV AUC = {cv_c_rf.mean():.4f}+/-{cv_c_rf.std():.4f}
+  {XGB_LABEL:<14}  ROC-AUC = {xgb_auc:.4f}  CV AUC = {cv_c_xgb.mean():.4f}+/-{cv_c_xgb.std():.4f}
+  {LGBM_LABEL:<14}  ROC-AUC = {lgbm_auc:.4f}  CV AUC = {cv_c_lgbm.mean():.4f}+/-{cv_c_lgbm.std():.4f}
+  Winner: {best_cls_name}
+
+  Anomaly Threshold : {threshold_anom:.4f} Mbps  (bottom {LOW_PERF_PCTILE}th percentile of active UEs)
+  Hurdle Threshold  : {HURDLE_THRESHOLD}
+""")
+
+results_df = pd.DataFrame([
+    {'Stage': 'Hurdle Stage 1', 'Model': 'Random Forest', 'Metric': 'Gate AUC',
+     'Value': h1_rf_auc,   'Winner': 'Yes' if best_h1_name=='Random Forest' else ''},
+    {'Stage': 'Hurdle Stage 1', 'Model': XGB_LABEL,       'Metric': 'Gate AUC',
+     'Value': h1_xgb_auc,  'Winner': 'Yes' if best_h1_name==XGB_LABEL else ''},
+    {'Stage': 'Hurdle Stage 1', 'Model': LGBM_LABEL,      'Metric': 'Gate AUC',
+     'Value': h1_lgbm_auc, 'Winner': 'Yes' if best_h1_name==LGBM_LABEL else ''},
+    {'Stage': 'Hurdle Stage 2 (active)', 'Model': 'Random Forest', 'Metric': 'Test R2',
+     'Value': h2_rf_m_tuned['TestR2'],   'Winner': 'Yes' if best_h2_name=='Random Forest' else ''},
+    {'Stage': 'Hurdle Stage 2 (active)', 'Model': XGB_LABEL,       'Metric': 'Test R2',
+     'Value': h2_xgb_m_tuned['TestR2'],  'Winner': 'Yes' if best_h2_name==XGB_LABEL else ''},
+    {'Stage': 'Hurdle Stage 2 (active)', 'Model': LGBM_LABEL,      'Metric': 'Test R2',
+     'Value': h2_lgbm_m_tuned['TestR2'], 'Winner': 'Yes' if best_h2_name==LGBM_LABEL else ''},
+    {'Stage': 'Combined Hurdle (full)',  'Model': 'Random Forest', 'Metric': 'Full R2',
+     'Value': hurdle_tuned_results.get('Random Forest',{}).get('r2',0), 'Winner': ''},
+    {'Stage': 'Combined Hurdle (full)',  'Model': XGB_LABEL,       'Metric': 'Full R2',
+     'Value': hurdle_tuned_results.get(XGB_LABEL,{}).get('r2',0),       'Winner': ''},
+    {'Stage': 'Combined Hurdle (full)',  'Model': LGBM_LABEL,      'Metric': 'Full R2',
+     'Value': hurdle_tuned_results.get(LGBM_LABEL,{}).get('r2',0),      'Winner': ''},
+    {'Stage': 'Stage 3 Anomaly',         'Model': 'Random Forest', 'Metric': 'AUC',
+     'Value': rf_auc,   'Winner': 'Yes' if best_cls_name=='Random Forest' else ''},
+    {'Stage': 'Stage 3 Anomaly',         'Model': XGB_LABEL,       'Metric': 'AUC',
+     'Value': xgb_auc,  'Winner': 'Yes' if best_cls_name==XGB_LABEL else ''},
+    {'Stage': 'Stage 3 Anomaly',         'Model': LGBM_LABEL,      'Metric': 'AUC',
+     'Value': lgbm_auc, 'Winner': 'Yes' if best_cls_name==LGBM_LABEL else ''},
+])
+results_df.to_csv('outputs/model_results_summary.csv', index=False)
+print(results_df.round(4).to_string(index=False))
+
+
+# ============================================================================
+# INFERENCE FUNCTION
+# ============================================================================
+
+def predict_hurdle(new_df: pd.DataFrame,
+                   hurdle_threshold: float = HURDLE_THRESHOLD) -> pd.DataFrame:
+    """
+    Run the full hurdle pipeline on new KPI observations.
+
+    Parameters
+    ----------
+    new_df           : DataFrame with raw KPI columns (BLER, PRBS, RU, etc.)
+    hurdle_threshold : probability cutoff for scheduling gate
+
+    Returns
+    -------
+    DataFrame with added prediction and anomaly columns.
+    """
+    out = new_df.copy()
+
+    out['BLER_High']         = (out['BLER'] > 0.1).astype(int)
+    out['PRBS_Norm']         = out['PRBS'] / (out['PRBS'].max() + 1e-9)
+    out['PRBS_Active']       = (out['PRBS'] > 0).astype(int)
+    out['PRBS_High']         = (out['PRBS'] > out['PRBS'].median()).astype(int)
+    out['RU_Norm']           = ((out['RU'] - out['RU'].min()) /
+                                 (out['RU'].max() - out['RU'].min() + 1e-9))
+    out['RU_High']           = (out['RU'] > out['RU'].median()).astype(int)
+    out['Effective_Resource']= out['PRBS'] * (1 - out['BLER'])
+    out['UE_Band_Encoded']   = pd.cut(out['UE_id'], bins=5, labels=False)
+    out['Time_Norm']         = ((out['time'] - out['time'].min()) /
+                                 (out['time'].max() - out['time'].min() + 1e-9))
+    if 'SINR' in out.columns:
+        out['SINR_Norm'] = ((out['SINR'] - out['SINR'].min()) /
+                            (out['SINR'].max() - out['SINR'].min() + 1e-9))
+        out['SINR_Good'] = (out['SINR'] > out['SINR'].median()).astype(int)
+    if 'Latitude' in out.columns and 'Longitude' in out.columns:
+        ref_lat = out['Latitude'].mean(); ref_lon = out['Longitude'].mean()
+        R = 6371000
+        dlat = np.radians(out['Latitude']  - ref_lat)
+        dlon = np.radians(out['Longitude'] - ref_lon)
+        a    = (np.sin(dlat/2)**2 +
+                np.cos(np.radians(ref_lat)) * np.cos(np.radians(out['Latitude']))
+                * np.sin(dlon/2)**2)
+        out['Distance_m'] = R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    if 'Altitude' in out.columns:
+        out['Altitude_Norm'] = ((out['Altitude'] - out['Altitude'].min()) /
+                                 (out['Altitude'].max() - out['Altitude'].min() + 1e-9))
+    if 'MobileState' in out.columns:
+        state_map = {'stationary': 0, 'walking': 1, 'driving': 2}
+        out['MobileState_Enc'] = (out['MobileState'].str.lower()
+                                   .map(state_map).fillna(1).astype(int))
+
+    X_new = out[[f for f in FEATURES if f in out.columns]]
+
+    p_scheduled              = best_h1_model.predict_proba(X_new)[:, 1]
+    is_scheduled             = (p_scheduled >= hurdle_threshold).astype(int)
+    out['P_Scheduled']        = p_scheduled
+    out['Is_Scheduled_Hurdle']= is_scheduled
+
+    rf_raw   = np.clip(best_h2_rf.predict(X_new),   0, None)
+    xgb_raw  = np.clip(best_h2_xgb.predict(X_new),  0, None)
+    lgbm_raw = np.clip(best_h2_lgbm.predict(X_new), 0, None)
+    ensemble = (rf_raw + xgb_raw + lgbm_raw) / 3.0
+
+    out['Predicted_DL_RF']       = rf_raw   * is_scheduled
+    out['Predicted_DL_XGB']      = xgb_raw  * is_scheduled
+    out['Predicted_DL_LGBM']     = lgbm_raw * is_scheduled
+    out['Predicted_DL_Ensemble'] = ensemble  * is_scheduled
+    out['Hurdle_DL_Ensemble']    = ensemble  * is_scheduled
+
+    out['Is_LowPerformance']  = best_cls_model.predict(X_new)
+    out['Anomaly_Probability']= best_cls_model.predict_proba(X_new)[:, 1]
+
+    return out
+
+
+# ============================================================================
+# PIPELINE COMPLETE
+# ============================================================================
+section("PIPELINE COMPLETE")
+print(f"""
+  Hurdle Stage 1 — Scheduling Gate:
+    Best model : {best_h1_name}  (Gate AUC = {best_h1_auc:.4f})
+    Trained on : ALL rows ({n_total:,})
+
+  Hurdle Stage 2 — Throughput Regressor:
+    Random Forest  R2 = {h2_rf_m_tuned['TestR2']:.4f}  RMSE = {h2_rf_m_tuned['RMSE']:.4f} Mbps
+    {XGB_LABEL:<14} R2 = {h2_xgb_m_tuned['TestR2']:.4f}  RMSE = {h2_xgb_m_tuned['RMSE']:.4f} Mbps
+    {LGBM_LABEL:<14} R2 = {h2_lgbm_m_tuned['TestR2']:.4f}  RMSE = {h2_lgbm_m_tuned['RMSE']:.4f} Mbps
+    Winner : {best_h2_name}
+
+  Combined Hurdle — Full-Population R2:
+    Random Forest  R2 = {hurdle_tuned_results.get('Random Forest',{}).get('r2',0):.4f}
+    {XGB_LABEL:<14} R2 = {hurdle_tuned_results.get(XGB_LABEL,{}).get('r2',0):.4f}
+    {LGBM_LABEL:<14} R2 = {hurdle_tuned_results.get(LGBM_LABEL,{}).get('r2',0):.4f}
+    Best Combo: {best_hurdle_tuned_tag}  (R2 = {best_hurdle_tuned['r2']:.4f})
+
+  Stage 3 — Anomaly Classifier (active UEs):
+    Random Forest  ROC-AUC = {rf_auc:.4f}  CV = {cv_c_rf.mean():.4f}+/-{cv_c_rf.std():.4f}
+    {XGB_LABEL:<14} ROC-AUC = {xgb_auc:.4f}  CV = {cv_c_xgb.mean():.4f}+/-{cv_c_xgb.std():.4f}
+    {LGBM_LABEL:<14} ROC-AUC = {lgbm_auc:.4f}  CV = {cv_c_lgbm.mean():.4f}+/-{cv_c_lgbm.std():.4f}
+    Winner : {best_cls_name}
+
+  Hurdle threshold  : {HURDLE_THRESHOLD}
+  Anomaly threshold : {threshold_anom:.4f} Mbps  (bottom {LOW_PERF_PCTILE}th percentile)
+
+  Saved figures (300 dpi) -> outputs/plots/
+    fig0_hurdle_architecture.png
+    fig1_hurdle_stage1_roc.png
+    fig2_actual_vs_predicted_[RF/XGB/LGBM].png
+    fig3_hurdle_combined_prediction.png
+    fig4_residuals_[RF/XGB/LGBM].png
+    fig5_stage3_roc_curves.png
+    fig6_confusion_matrix_[RF/XGB/LGBM].png
+    fig7_feature_importances_[stage2/stage3].png
+    fig8_three_model_comparison.png
+    fig9_cross_validation_[r2/auc].png
+    fig10_precision_recall.png
+    fig11_anomaly_distribution.png
+""")
+
+if IN_COLAB:
+    import glob
+    section("COLAB — SAVED FILES")
+    all_files = ([MERGED_FILE]
+                 + glob.glob('outputs/*.csv')
+                 + glob.glob('outputs/eda/*')
+                 + glob.glob('outputs/plots/*.png')
+                 + glob.glob('outputs/models/*.pkl'))
+    print(f"  Total files saved: {len(all_files)}")
+    for f in sorted(all_files):
+        print(f"    {f}")
+    print("\n  To download: Colab sidebar -> Files -> right-click -> Download")
+else:
+    print("  All outputs saved to outputs/")
