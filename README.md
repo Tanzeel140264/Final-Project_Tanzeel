@@ -1,14 +1,14 @@
-1. Project Overview
+**1. Project Overview: **
 In this project, we have designed a three-step pipeline of Machine Learning to predict DL throughput for 5G networks along with anomaly detection.
 By using a Hurdle Model architecture, the system accurately handles "zero-inflated" data (idle states) while maintaining high regression accuracy for active transmissions """
 
-2. PIPELINE ARCHITECTURE
+**2. PIPELINE ARCHITECTURE**
 The system operates through three specialized stages:
 Stage 1: Scheduling Gate – A binary classifier (Random Forest/XGBoost) that distinguishes between scheduled (THP > 0) and unscheduled (THP = 0) states.
 Stage 2: Throughput Regressor – A tuned regression model that estimates the exact throughput for active users.
 Stage 3: Anomaly Classifier – A diagnostic tool that flags UEs in the bottom 10th percentile of performance (Anomalies).
 
-3. CORE TECHNICAL COMPONENTS
+**3. CORE TECHNICAL COMPONENTS**
 Algorithms: Comparative analysis between Random Forest, XGBoost, and LightGBM.
 Feature Engineering: 19 features including Effective Resource (PRBs × (1-BLER)), SINR, and Distance.
 Optimization: Sequential RandomizedSearchCV and GridSearchCV for hyperparameter tuning.
