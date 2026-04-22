@@ -1,1 +1,5 @@
+****Project Overview****
+
+"" In this project, we have designed a three-step pipeline of Machine Learning to predict DL throughput for 5G networks along with anomaly detection.
+By using a Hurdle Model architecture, the system accurately handles "zero-inflated" data (idle states) while maintaining high regression accuracy for active transmissions """
 
